@@ -34,7 +34,7 @@ def tratar_cliente(conn, addr):
 
                 if dados.get("TASK") == "HEARTBEAT":
                     resposta = {
-                        "SERVER_UUID": "Master_A",
+                        "SERVER_UUID": "Master_4",
                         "TASK": "HEARTBEAT",
                         "RESPONSE": "ALIVE"
                     }
