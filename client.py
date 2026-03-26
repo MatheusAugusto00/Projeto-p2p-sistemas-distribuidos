@@ -2,7 +2,7 @@ import socket
 import json
 import time
 
-HOST = '127.0.0.1'
+HOST = '10.62.217.213'
 PORT = 8000
 
 def enviar_heartbeat():
@@ -12,7 +12,7 @@ def enviar_heartbeat():
             s.connect((HOST, PORT))
 
             mensagem = {
-                "SERVER_UUID": "Worker_A1",
+                "SERVER_UUID": "MASTER_4",
                 "TASK": "HEARTBEAT"
             }
 
@@ -21,7 +21,15 @@ def enviar_heartbeat():
             resposta = s.recv(1024)
 
             if resposta:
-                print("[RESPOSTA]:", resposta.decode().strip())
+                try:
+                    resposta_str = resposta.decode().strip()
+                    resposta_json = json.loads(resposta_str)
+
+                    print("[RESPOSTA]:")
+                    print(json.dumps(resposta_json, indent=4, ensure_ascii=False) + "\n")
+
+                except json.JSONDecodeError:
+                    print("[RESPOSTA NÃO É JSON]:", resposta.decode().strip())
 
             s.close()
 
