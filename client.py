@@ -1,43 +1,73 @@
 import socket
 import json
 import time
+import random
 
-HOST = '10.62.217.213'
+HOST = '127.0.0.1'
 PORT = 8000
 
-def enviar_heartbeat():
+WORKER_ID = "W-123"
+
+def receber_mensagem(sock):
+    buffer = ""
+    while "\n" not in buffer:
+        data = sock.recv(1024)
+        if not data:
+            break
+        buffer += data.decode()
+    return buffer.strip()
+
+
+def worker_loop():
     while True:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((HOST, PORT))
 
+            print("[WORKER] Conectado ao Master")
+
+
             mensagem = {
-                "SERVER_UUID": "MASTER_4",
-                "TASK": "HEARTBEAT"
+                "WORKER": "ALIVE",
+                "WORKER_UUID": WORKER_ID
             }
 
             s.sendall((json.dumps(mensagem) + "\n").encode())
 
-            resposta = s.recv(1024)
+
+            resposta = receber_mensagem(s)
 
             if resposta:
-                try:
-                    resposta_str = resposta.decode().strip()
-                    resposta_json = json.loads(resposta_str)
+                dados = json.loads(resposta)
+                print("[MASTER]:", dados)
 
-                    print("[RESPOSTA]:")
-                    print(json.dumps(resposta_json, indent=4, ensure_ascii=False) + "\n")
+                if dados.get("TASK") == "QUERY":
+                    print("[WORKER] Processando tarefa...")
 
-                except json.JSONDecodeError:
-                    print("[RESPOSTA NÃO É JSON]:", resposta.decode().strip())
+                    time.sleep(random.randint(1, 3))
+
+                    status = {
+                        "STATUS": "OK",
+                        "TASK": "QUERY",
+                        "WORKER_UUID": WORKER_ID
+                    }
+
+                    s.sendall((json.dumps(status) + "\n").encode())
+
+
+                    ack = receber_mensagem(s)
+                    print("[ACK]:", ack)
+
+                elif dados.get("TASK") == "NO_TASK":
+                    print("[WORKER] Nenhuma tarefa disponível.")
 
             s.close()
 
         except Exception as e:
             print("[ERRO]:", e)
 
-        time.sleep(10)
+        time.sleep(5)
 
 
-if __name__ == "__main__":
-    enviar_heartbeat()
+if name == "main":
+    worker_loop()
