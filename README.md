@@ -15,6 +15,7 @@ O fluxo atual cobre:
 
 - [server.py](/Users/level33/studies/arq/Projeto-p2p-sistemas-distribuidos/server.py): implementa o Master.
 - [client.py](/Users/level33/studies/arq/Projeto-p2p-sistemas-distribuidos/client.py): implementa o Worker.
+- [docs/superpowers/specs](/Users/level33/studies/arq/Projeto-p2p-sistemas-distribuidos/docs/superpowers/specs): specs de design produzidas antes da implementacao.
 
 ## Funcionalidades implementadas
 
@@ -150,3 +151,34 @@ Tambem e possivel customizar:
 - O Worker usa timeout de 5 segundos para nao ficar bloqueado indefinidamente.
 - O processamento da fila no Master esta protegido por `Lock` para evitar condicoes de corrida entre threads.
 - O protocolo ignora extensoes nao usadas diretamente, mas exige a presenca dos campos obrigatorios nas mensagens conhecidas.
+
+## Integracao com Obra Superpowers
+
+Este repositorio foi preparado para trabalhar com a skill `brainstorming` da Obra Superpowers:
+
+- Specs aprovadas devem ser salvas em `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`.
+- Nenhuma implementacao nova deve comecar sem uma spec curta ou detalhada, dependendo da complexidade.
+- O fluxo recomendado e: `brainstorming -> revisao da spec -> plano de implementacao -> codigo`.
+
+### Estrutura adicionada
+
+```text
+docs/
+  superpowers/
+    specs/
+      TEMPLATE-design.md
+```
+
+### Como usar no projeto
+
+1. Antes de codar, defina o escopo da mudanca em uma spec dentro de `docs/superpowers/specs/`.
+2. Use [docs/superpowers/specs/TEMPLATE-design.md](/Users/level33/studies/arq/Projeto-p2p-sistemas-distribuidos/docs/superpowers/specs/TEMPLATE-design.md) como base.
+3. Registre arquitetura, componentes, fluxo de dados, erros e testes.
+4. So depois da aprovacao da spec avance para implementacao no `server.py`, `client.py` ou arquivos futuros.
+
+### Quando criar uma spec
+
+- Nova mensagem no protocolo.
+- Novo papel na rede P2P.
+- Mudanca no fluxo de distribuicao de tarefas.
+- Persistencia, retries, descoberta de peers, eleicao de lider, replicacao ou tolerancia a falhas.
