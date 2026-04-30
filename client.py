@@ -4,7 +4,7 @@ import random
 import socket
 import time
 
-HOST = os.getenv("MASTER_HOST", "127.0.0.1")
+HOST = os.getenv("MASTER_HOST", "10.62.217.40")
 PORT = int(os.getenv("MASTER_PORT", "8000"))
 
 WORKER_ID = os.getenv("WORKER_ID", f"W-{os.getpid()}")
@@ -80,6 +80,7 @@ def worker_loop():
                 task = validar_resposta_inicial(resposta)
                 if task == "NO_TASK":
                     print(f"[WORKER {WORKER_ID}] Nenhuma tarefa disponivel.")
+                    time.sleep(3)
                     continue
 
                 current_task = resposta["USER"]
