@@ -3,6 +3,8 @@ import os
 import random
 import socket
 import time
+import uuid
+from dataclasses import dataclass
 
 HOST = os.getenv("MASTER_HOST", "10.62.217.40")
 PORT = int(os.getenv("MASTER_PORT", "8000"))
@@ -13,8 +15,54 @@ RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY", "5"))
 MASTER_TIMEOUT = int(os.getenv("MASTER_TIMEOUT", "5"))
 
 
+@dataclass
+class WorkerState:
+    worker_id: str
+    original_master_host: str
+    original_master_port: int
+    current_master_host: str = None
+    current_master_port: int = None
+    origin_server_uuid: str = None
+
+    def __post_init__(self):
+        if self.current_master_host is None:
+            self.current_master_host = self.original_master_host
+        if self.current_master_port is None:
+            self.current_master_port = self.original_master_port
+
+    @property
+    def original_master_address(self):
+        return format_address(self.original_master_host, self.original_master_port)
+
+
+worker_state = WorkerState(
+    worker_id=WORKER_ID,
+    original_master_host=HOST,
+    original_master_port=PORT,
+    origin_server_uuid=SERVER_UUID,
+)
+
+
 def send_json(sock, payload):
     sock.sendall((json.dumps(payload) + "\n").encode())
+
+
+def format_address(host, port):
+    return f"{host}:{port}"
+
+
+def parse_address(address):
+    try:
+        host, port = address.rsplit(":", 1)
+    except ValueError as exc:
+        raise ValueError(f"Endereco invalido: {address}") from exc
+    if not host.strip():
+        raise ValueError(f"Endereco invalido: {address}")
+    return host.strip(), int(port)
+
+
+def build_typed_message(message_type, payload):
+    return {"type": message_type, "request_id": str(uuid.uuid4()), "payload": payload}
 
 
 def receber_mensagem(sock):
@@ -38,13 +86,50 @@ def parse_server_message(raw_message):
 
 
 def montar_payload_apresentacao():
-    payload = {"WORKER": "ALIVE", "WORKER_UUID": WORKER_ID}
-    if SERVER_UUID:
-        payload["SERVER_UUID"] = SERVER_UUID
+    payload = {"WORKER": "ALIVE", "WORKER_UUID": worker_state.worker_id}
+    if worker_state.origin_server_uuid:
+        payload["SERVER_UUID"] = worker_state.origin_server_uuid
     return payload
 
 
+def build_register_temporary_worker_payload(state):
+    return build_typed_message(
+        "register_temporary_worker",
+        {
+            "worker_id": state.worker_id,
+            "original_master_address": state.original_master_address,
+        },
+    )
+
+
+def apply_command_redirect(state, payload):
+    new_master_address = payload.get("new_master_address")
+    if not isinstance(new_master_address, str) or not new_master_address.strip():
+        raise ValueError("command_redirect sem new_master_address valido")
+
+    original_master_address = payload.get("original_master_address", state.original_master_address)
+    if not isinstance(original_master_address, str) or not original_master_address.strip():
+        raise ValueError("command_redirect sem original_master_address valido")
+
+    state.current_master_host, state.current_master_port = parse_address(new_master_address)
+    state.original_master_host, state.original_master_port = parse_address(original_master_address)
+    state.origin_server_uuid = original_master_address
+    return build_register_temporary_worker_payload(state)
+
+
+def apply_command_release(state, payload):
+    original_master_address = payload.get("original_master_address", state.original_master_address)
+    if not isinstance(original_master_address, str) or not original_master_address.strip():
+        raise ValueError("command_release sem original_master_address valido")
+
+    state.current_master_host, state.current_master_port = parse_address(original_master_address)
+    state.original_master_host, state.original_master_port = parse_address(original_master_address)
+    state.origin_server_uuid = None
+
+
 def validar_resposta_inicial(payload):
+    if payload.get("type") in {"command_redirect", "command_release"}:
+        return payload["type"]
     task = payload.get("TASK")
     if task == "QUERY":
         if not isinstance(payload.get("USER"), str) or not payload["USER"].strip():
@@ -60,16 +145,22 @@ def validar_resposta_inicial(payload):
 def validar_ack(payload):
     if payload.get("STATUS") != "ACK":
         raise ValueError(f"ACK invalido: {payload}")
-    if payload.get("WORKER_UUID") != WORKER_ID:
+    if payload.get("WORKER_UUID") != worker_state.worker_id:
         raise ValueError(f"ACK destinado a outro worker: {payload}")
 
 
 def worker_loop():
     while True:
         try:
-            with socket.create_connection((HOST, PORT), timeout=MASTER_TIMEOUT) as sock:
+            with socket.create_connection(
+                (worker_state.current_master_host, worker_state.current_master_port),
+                timeout=MASTER_TIMEOUT,
+            ) as sock:
                 sock.settimeout(MASTER_TIMEOUT)
-                print(f"[WORKER {WORKER_ID}] Conectado ao Master")
+                print(
+                    f"[WORKER {worker_state.worker_id}] Conectado ao Master "
+                    f"{worker_state.current_master_host}:{worker_state.current_master_port}"
+                )
 
                 apresentacao = montar_payload_apresentacao()
                 send_json(sock, apresentacao)
@@ -78,19 +169,41 @@ def worker_loop():
                 print("[MASTER]:", resposta)
 
                 task = validar_resposta_inicial(resposta)
+                if task == "command_redirect":
+                    register_payload = apply_command_redirect(worker_state, resposta["payload"])
+                    print(
+                        f"[REDIRECT] Worker {worker_state.worker_id} indo para "
+                        f"{worker_state.current_master_host}:{worker_state.current_master_port}"
+                    )
+                    with socket.create_connection(
+                        (worker_state.current_master_host, worker_state.current_master_port),
+                        timeout=MASTER_TIMEOUT,
+                    ) as register_sock:
+                        register_sock.settimeout(MASTER_TIMEOUT)
+                        send_json(register_sock, register_payload)
+                        register_ack = parse_server_message(receber_mensagem(register_sock))
+                        print("[REGISTER ACK]:", register_ack)
+                    continue
+                if task == "command_release":
+                    apply_command_release(worker_state, resposta["payload"])
+                    print(
+                        f"[RELEASE] Worker {worker_state.worker_id} voltando para "
+                        f"{worker_state.current_master_host}:{worker_state.current_master_port}"
+                    )
+                    continue
                 if task == "NO_TASK":
-                    print(f"[WORKER {WORKER_ID}] Nenhuma tarefa disponivel.")
+                    print(f"[WORKER {worker_state.worker_id}] Nenhuma tarefa disponivel.")
                     time.sleep(3)
                     continue
 
                 current_task = resposta["USER"]
-                print(f"[WORKER {WORKER_ID}] Processando tarefa para usuario {current_task}...")
+                print(f"[WORKER {worker_state.worker_id}] Processando tarefa para usuario {current_task}...")
                 time.sleep(random.randint(1, 3))
 
                 status = {
                     "STATUS": random.choice(["OK", "NOK"]),
                     "TASK": "QUERY",
-                    "WORKER_UUID": WORKER_ID,
+                    "WORKER_UUID": worker_state.worker_id,
                     "USER": current_task,
                 }
 
@@ -108,7 +221,7 @@ def worker_loop():
         except Exception as exc:
             print(f"[ERRO]: {exc}")
 
-        print(f"[WORKER {WORKER_ID}] Nova tentativa em {RECONNECT_DELAY} segundos.")
+        print(f"[WORKER {worker_state.worker_id}] Nova tentativa em {RECONNECT_DELAY} segundos.")
         time.sleep(RECONNECT_DELAY)
 
 

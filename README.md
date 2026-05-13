@@ -10,6 +10,7 @@ O fluxo atual cobre:
 
 - Sprint 1: heartbeat entre Worker e Master para verificar disponibilidade.
 - Sprint 2: apresentacao do Worker, distribuicao de tarefas, processamento simulado, envio de status final e confirmacao por `ACK`.
+- Sprint 3: negociacao P2P entre Masters, redirecionamento temporario de Workers emprestados e devolucao ao Master de origem.
 
 ## Arquivos
 
@@ -28,6 +29,15 @@ O fluxo atual cobre:
 - Distribui uma tarefa com `TASK: QUERY` ou informa `TASK: NO_TASK`.
 - Recebe o status final da tarefa (`OK` ou `NOK`).
 - Retorna confirmacao final com `STATUS: ACK`.
+- Atua tambem como cliente TCP para pedir ajuda a Masters vizinhos quando a fila ultrapassa `CAPACITY`.
+- Monitora saturacao em uma thread propria, sem depender da chegada de Workers locais.
+- Processa mensagens Master-to-Master com `type`, `request_id` e `payload`.
+- Mantem as tarefas separadas em `Em fila`, `Em atividade` e `Feito`.
+- Responde `response_accepted` ou `response_rejected` para pedidos `request_help`.
+- Enfileira `command_redirect` para Workers locais ociosos ofertados a outro Master.
+- Registra Workers emprestados com `register_temporary_worker`.
+- Enfileira `command_release` e envia `notify_worker_returned` quando a carga cai abaixo de `RELEASE_THRESHOLD`.
+- Se um Worker desconectar enquanto processa uma tarefa, devolve a tarefa para o inicio da fila.
 - Faz validacao basica dos payloads e registra erros de protocolo.
 
 ### Worker
@@ -38,6 +48,8 @@ O fluxo atual cobre:
 - Processa a tarefa recebida com simulacao de trabalho.
 - Envia o status final da tarefa para o Master.
 - Aguarda `ACK` e tenta reconectar automaticamente em caso de falha.
+- Trata `command_redirect`, troca o Master atual e envia `register_temporary_worker`.
+- Trata `command_release`, volta ao Master original e remove o campo `SERVER_UUID` da apresentacao.
 
 ## Protocolo JSON
 
@@ -104,6 +116,93 @@ O campo `STATUS` pode ser `OK` ou `NOK`.
 }
 ```
 
+### 5. Pedido de ajuda entre Masters
+
+```json
+{
+  "type": "request_help",
+  "request_id": "uuid-v4",
+  "payload": {
+    "master_id": "Master_A",
+    "current_load": 150,
+    "capacity": 100,
+    "workers_needed": 2,
+    "return_address": "127.0.0.1:8000"
+  }
+}
+```
+
+Resposta aceita:
+
+```json
+{
+  "type": "response_accepted",
+  "request_id": "uuid-v4",
+  "payload": {
+    "workers_offered": 1,
+    "worker_details": [
+      { "id": "B1", "address": "dynamic" }
+    ]
+  }
+}
+```
+
+Resposta recusada:
+
+```json
+{
+  "type": "response_rejected",
+  "request_id": "uuid-v4",
+  "payload": {
+    "reason": "no_workers_available"
+  }
+}
+```
+
+### 6. Redirecionamento, registro e devolucao
+
+```json
+{
+  "type": "command_redirect",
+  "request_id": "uuid-v4",
+  "payload": {
+    "new_master_address": "127.0.0.1:8000",
+    "original_master_address": "127.0.0.1:8001"
+  }
+}
+```
+
+```json
+{
+  "type": "register_temporary_worker",
+  "request_id": "uuid-v4",
+  "payload": {
+    "worker_id": "B1",
+    "original_master_address": "127.0.0.1:8001"
+  }
+}
+```
+
+```json
+{
+  "type": "command_release",
+  "request_id": "uuid-v4",
+  "payload": {
+    "original_master_address": "127.0.0.1:8001"
+  }
+}
+```
+
+```json
+{
+  "type": "notify_worker_returned",
+  "request_id": "uuid-v4",
+  "payload": {
+    "worker_id": "B1"
+  }
+}
+```
+
 ## Como executar
 
 Em um terminal, inicie o Master:
@@ -130,27 +229,59 @@ Tambem e possivel customizar:
 - `MASTER_HOST`
 - `MASTER_PORT`
 - `MASTER_UUID`
+- `PEER_MASTERS`: vizinhos no formato `Master_B@127.0.0.1:8001,Master_C@127.0.0.1:8002`.
+- `INITIAL_TASK_COUNT`: quantidade inicial de tarefas criadas pelo Master.
+- `CAPACITY`: quantidade de tarefas pendentes que dispara `request_help`.
+- `RELEASE_THRESHOLD`: carga abaixo da qual Workers emprestados podem ser devolvidos.
+- `HELP_CHECK_INTERVAL`: intervalo, em segundos, entre verificacoes de saturacao.
 - `WORKER_ID`
 - `SERVER_UUID`
 - `MASTER_TIMEOUT`
 - `RECONNECT_DELAY`
+
+### Simulacao local da Sprint 3
+
+Terminal 1, Master A saturado em `8000`:
+
+```bash
+MASTER_UUID=Master_A MASTER_HOST=127.0.0.1 MASTER_PORT=8000 INITIAL_TASK_COUNT=50 CAPACITY=5 RELEASE_THRESHOLD=2 PEER_MASTERS=Master_B@127.0.0.1:8001 python3 server.py
+```
+
+Terminal 2, Master B vizinho em `8001`:
+
+```bash
+MASTER_UUID=Master_B MASTER_HOST=127.0.0.1 MASTER_PORT=8001 INITIAL_TASK_COUNT=0 CAPACITY=100 RELEASE_THRESHOLD=60 PEER_MASTERS=Master_A@127.0.0.1:8000 python3 server.py
+```
+
+Terminal 3, Worker local do Master B:
+
+```bash
+WORKER_ID=B1 MASTER_HOST=127.0.0.1 MASTER_PORT=8001 python3 client.py
+```
+
+Quando o Master A detectar carga acima de `CAPACITY`, a thread de monitoramento envia `request_help` ao Master B. O Master B foi iniciado com `INITIAL_TASK_COUNT=0` para manter B1 e B2 ociosos e disponiveis para emprestimo. O Worker recebe `command_redirect` na proxima apresentacao. Depois de redirecionado, ele registra `register_temporary_worker` no Master A e passa a pedir tarefas com `SERVER_UUID` apontando para o Master de origem.
 
 ## Comportamento esperado
 
 1. O Worker abre uma conexao TCP com o Master.
 2. O Worker envia sua mensagem de apresentacao.
 3. O Master responde com `QUERY` ou `NO_TASK`.
-4. Se houver tarefa, o Worker simula o processamento.
-5. O Worker envia o resultado com `STATUS: OK` ou `STATUS: NOK`.
-6. O Master registra o resultado e responde com `ACK`.
-7. O Worker fecha o ciclo e tenta novamente apos o intervalo configurado.
+4. Se houver tarefa, o Master move a tarefa de `Em fila` para `Em atividade`.
+5. O Worker simula o processamento.
+6. O Worker envia o resultado com `STATUS: OK` ou `STATUS: NOK`.
+7. O Master move a tarefa de `Em atividade` para `Feito` e responde com `ACK`.
+8. Se a conexao cair antes do `STATUS`, o Master remove a tarefa de `Em atividade` e devolve para o inicio de `Em fila`.
+9. O Worker fecha o ciclo e tenta novamente apos o intervalo configurado.
+10. Na Sprint 3, quando ha saturacao, o Master negocia Workers com vizinhos e pode devolver Workers emprestados quando a carga normaliza.
 
 ## Observacoes de implementacao
 
 - O Master usa `SO_REUSEADDR` para facilitar reinicios.
 - O Worker usa timeout de 5 segundos para nao ficar bloqueado indefinidamente.
-- O processamento da fila no Master esta protegido por `Lock` para evitar condicoes de corrida entre threads.
+- O processamento das listas de tarefas no Master esta protegido por `Lock` para evitar condicoes de corrida entre threads.
 - O protocolo ignora extensoes nao usadas diretamente, mas exige a presenca dos campos obrigatorios nas mensagens conhecidas.
+- Mensagens Master-to-Master usam `type` em minusculas, `request_id` para correlacao e `payload` com os dados da operacao.
+- Tipos Master-to-Master desconhecidos sao registrados em log e ignorados para manter compatibilidade com extensoes futuras.
 
 ## Integracao com Obra Superpowers
 
