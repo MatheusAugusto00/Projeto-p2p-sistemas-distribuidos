@@ -2,17 +2,19 @@ import json
 import os
 import random
 import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 
-HOST = os.getenv("MASTER_HOST", "10.62.217.40")
+HOST = os.getenv("MASTER_HOST", "127.0.0.1")
 PORT = int(os.getenv("MASTER_PORT", "8000"))
 
 WORKER_ID = os.getenv("WORKER_ID", f"W-{os.getpid()}")
 SERVER_UUID = os.getenv("SERVER_UUID")
 RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY", "5"))
 MASTER_TIMEOUT = int(os.getenv("MASTER_TIMEOUT", "5"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "2"))
 
 
 @dataclass
@@ -45,6 +47,10 @@ worker_state = WorkerState(
 
 def send_json(sock, payload):
     sock.sendall((json.dumps(payload) + "\n").encode())
+
+
+def log_event(level, message):
+    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] [{level}] {message}")
 
 
 def format_address(host, port):
@@ -83,6 +89,32 @@ def parse_server_message(raw_message):
         return json.loads(raw_message)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Mensagem JSON invalida: {exc}") from exc
+
+
+def build_heartbeat_payload(state):
+    payload = {
+        "WORKER_UUID": state.worker_id,
+    }
+    if state.origin_server_uuid:
+        payload["SERVER_UUID"] = state.origin_server_uuid
+    return build_typed_message("heartbeat", payload)
+
+
+def heartbeat_loop():
+    while True:
+        try:
+            with socket.create_connection(
+                (worker_state.current_master_host, worker_state.current_master_port),
+                timeout=MASTER_TIMEOUT,
+            ) as sock:
+                sock.settimeout(MASTER_TIMEOUT)
+                send_json(sock, build_heartbeat_payload(worker_state))
+                raw = receber_mensagem(sock)
+                resposta = parse_server_message(raw)
+                log_event("HEARTBEAT", f"Heartbeat enviado a {worker_state.current_master_host}:{worker_state.current_master_port} - resposta {resposta}")
+        except (ConnectionError, TimeoutError, socket.timeout, OSError, ValueError) as exc:
+            log_event("HEARTBEAT", f"Falha ao enviar heartbeat: {exc}")
+        time.sleep(HEARTBEAT_INTERVAL)
 
 
 def montar_payload_apresentacao():
@@ -166,14 +198,14 @@ def worker_loop():
                 send_json(sock, apresentacao)
 
                 resposta = parse_server_message(receber_mensagem(sock))
-                print("[MASTER]:", resposta)
+                log_event("MASTER", f"Resposta recebida: {resposta}")
 
                 task = validar_resposta_inicial(resposta)
                 if task == "command_redirect":
                     register_payload = apply_command_redirect(worker_state, resposta["payload"])
-                    print(
-                        f"[REDIRECT] Worker {worker_state.worker_id} indo para "
-                        f"{worker_state.current_master_host}:{worker_state.current_master_port}"
+                    log_event(
+                        "REDIRECT",
+                        f"Worker {worker_state.worker_id} indo para {worker_state.current_master_host}:{worker_state.current_master_port}",
                     )
                     with socket.create_connection(
                         (worker_state.current_master_host, worker_state.current_master_port),
@@ -186,18 +218,18 @@ def worker_loop():
                     continue
                 if task == "command_release":
                     apply_command_release(worker_state, resposta["payload"])
-                    print(
-                        f"[RELEASE] Worker {worker_state.worker_id} voltando para "
-                        f"{worker_state.current_master_host}:{worker_state.current_master_port}"
+                    log_event(
+                        "RELEASE",
+                        f"Worker {worker_state.worker_id} voltando para {worker_state.current_master_host}:{worker_state.current_master_port}",
                     )
                     continue
                 if task == "NO_TASK":
-                    print(f"[WORKER {worker_state.worker_id}] Nenhuma tarefa disponivel.")
+                    log_event("WORKER", f"{worker_state.worker_id} sem tarefa disponivel")
                     time.sleep(3)
                     continue
 
                 current_task = resposta["USER"]
-                print(f"[WORKER {worker_state.worker_id}] Processando tarefa para usuario {current_task}...")
+                log_event("WORKER", f"{worker_state.worker_id} processando tarefa {current_task}")
                 time.sleep(random.randint(1, 3))
 
                 status = {
@@ -211,19 +243,21 @@ def worker_loop():
 
                 ack = parse_server_message(receber_mensagem(sock))
                 validar_ack(ack)
-                print(f"[ACK] Task {current_task} confirmada:", ack)
+                log_event("ACK", f"Task {current_task} confirmada {ack}")
         except (ConnectionError, TimeoutError, socket.timeout) as exc:
-            print(f"[TIMEOUT/CONEXAO]: {exc}")
+            log_event("CONNECTION", f"{exc}")
         except ValueError as exc:
-            print(f"[PROTOCOLO]: {exc}")
+            log_event("PROTOCOLO", f"{exc}")
         except OSError as exc:
-            print(f"[ERRO DE SOCKET]: {exc}")
+            log_event("SOCKET", f"{exc}")
         except Exception as exc:
-            print(f"[ERRO]: {exc}")
+            log_event("ERRO", f"{exc}")
 
-        print(f"[WORKER {worker_state.worker_id}] Nova tentativa em {RECONNECT_DELAY} segundos.")
+        log_event("RECONNECT", f"Nova tentativa em {RECONNECT_DELAY} segundos")
         time.sleep(RECONNECT_DELAY)
 
 
 if __name__ == "__main__":
+    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
     worker_loop()

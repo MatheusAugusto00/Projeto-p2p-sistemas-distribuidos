@@ -4,6 +4,7 @@ import socket
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 
 HOST = os.getenv("MASTER_HOST", "127.0.0.1")
@@ -16,6 +17,10 @@ RELEASE_THRESHOLD = int(os.getenv("RELEASE_THRESHOLD", str(int(CAPACITY * 0.6)))
 PEER_MASTERS = os.getenv("PEER_MASTERS", "")
 HELP_CHECK_INTERVAL = int(os.getenv("HELP_CHECK_INTERVAL", "2"))
 INITIAL_TASK_COUNT = int(os.getenv("INITIAL_TASK_COUNT", "50"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "2"))
+HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "8"))
+HEARTBEAT_CHECK_INTERVAL = int(os.getenv("HEARTBEAT_CHECK_INTERVAL", "2"))
+MAX_MISSED_HEARTBEATS = int(os.getenv("MAX_MISSED_HEARTBEATS", "3"))
 
 
 def build_initial_tasks(task_count):
@@ -71,6 +76,69 @@ def log_protocol(direction, message_type, request_id, detail=""):
     print(f"[{timestamp()}] [{direction}] type={message_type} request_id={request_id}{suffix}")
 
 
+def log_event(level, message):
+    print(f"[{timestamp()}] [{level}] {message}")
+
+
+@dataclass
+class Task:
+    name: str
+    worker_uuid: str = None
+    server_uuid: str = None
+    origin_server_uuid: str = None
+    started_at: str = None
+    status: str = "TODO"
+
+
+class TaskManager:
+    def __init__(self, initial_tasks):
+        self.tasks_todo = deque(Task(name=name) for name in initial_tasks)
+        self.tasks_doing = {}
+        self.lock = threading.Lock()
+
+    def add_task(self, task_name):
+        with self.lock:
+            self.tasks_todo.append(Task(name=task_name))
+
+    def assign_task(self, worker_uuid, server_uuid):
+        with self.lock:
+            if not self.tasks_todo:
+                return None
+            task = self.tasks_todo.popleft()
+            task.worker_uuid = worker_uuid
+            task.server_uuid = server_uuid
+            task.started_at = timestamp()
+            task.status = "DOING"
+            self.tasks_doing[worker_uuid] = task
+            return task
+
+    def complete_task(self, worker_uuid):
+        with self.lock:
+            task = self.tasks_doing.pop(worker_uuid, None)
+            if task is None:
+                return None
+            task.status = "DONE"
+            task.completed_at = timestamp()
+            return task
+
+    def requeue_task(self, worker_uuid):
+        with self.lock:
+            task = self.tasks_doing.pop(worker_uuid, None)
+            if task is None:
+                return None
+            task.worker_uuid = None
+            task.server_uuid = None
+            task.origin_server_uuid = None
+            task.started_at = None
+            task.status = "TODO"
+            self.tasks_todo.appendleft(task)
+            return task
+
+    def get_load(self):
+        with self.lock:
+            return len(self.tasks_todo) + len(self.tasks_doing)
+
+
 @dataclass
 class MasterState:
     master_uuid: str
@@ -85,54 +153,81 @@ class MasterState:
     pending_redirects: dict = field(default_factory=dict)
     pending_releases: dict = field(default_factory=dict)
     help_request_pending: bool = False
+    worker_heartbeats: dict = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
-        self.tasks_pending = self.task_queue
-        self.tasks_in_progress = {}
+        self.task_manager = TaskManager(self.task_queue)
         self.tasks_done = []
+
+    @property
+    def tasks_pending(self):
+        return [task.name for task in self.task_manager.tasks_todo]
+
+    @property
+    def tasks_in_progress(self):
+        return {worker: task.name for worker, task in self.task_manager.tasks_doing.items()}
 
     def register_local_worker(self, worker_uuid):
         with self.lock:
             if worker_uuid not in self.borrowed_workers:
                 self.local_workers.add(worker_uuid)
 
-    def mark_worker_busy(self, worker_uuid):
+    def register_worker_heartbeat(self, worker_uuid, origin_server_uuid=None):
         with self.lock:
-            self.busy_workers.add(worker_uuid)
+            self.worker_heartbeats[worker_uuid] = {
+                "last_heartbeat": time.time(),
+                "missed_intervals": 0,
+                "origin_server_uuid": origin_server_uuid,
+            }
+            if origin_server_uuid:
+                self.borrowed_workers.setdefault(
+                    worker_uuid,
+                    {"original_master_address": origin_server_uuid, "registered_at": timestamp()},
+                )
+            else:
+                self.local_workers.add(worker_uuid)
 
-    def mark_worker_idle(self, worker_uuid):
+    def update_worker_heartbeat(self, worker_uuid, origin_server_uuid=None):
         with self.lock:
-            self.busy_workers.discard(worker_uuid)
+            heartbeat = self.worker_heartbeats.setdefault(
+                worker_uuid,
+                {
+                    "last_heartbeat": time.time(),
+                    "missed_intervals": 0,
+                    "origin_server_uuid": origin_server_uuid,
+                },
+            )
+            heartbeat["last_heartbeat"] = time.time()
+            heartbeat["missed_intervals"] = 0
+            if origin_server_uuid:
+                heartbeat["origin_server_uuid"] = origin_server_uuid
+            return heartbeat
 
     def assign_next_task(self, worker_uuid):
+        task = self.task_manager.assign_task(worker_uuid, self.master_uuid)
+        if task is None:
+            return None
         with self.lock:
-            if not self.tasks_pending:
-                return None
-            task_name = self.tasks_pending.pop(0)
-            self.tasks_in_progress[worker_uuid] = task_name
             self.busy_workers.add(worker_uuid)
-            return task_name
+        return task.name
 
     def complete_worker_task(self, worker_uuid, status):
+        task = self.task_manager.complete_task(worker_uuid)
         with self.lock:
-            task_name = self.tasks_in_progress.pop(worker_uuid, None)
             self.busy_workers.discard(worker_uuid)
-            if task_name is None:
+            if task is None:
                 return None
             self.tasks_done.append(
-                {"worker_uuid": worker_uuid, "task": task_name, "status": status}
+                {"worker_uuid": worker_uuid, "task": task.name, "status": status}
             )
-            return task_name
+        return task.name
 
     def requeue_worker_task(self, worker_uuid):
+        task = self.task_manager.requeue_task(worker_uuid)
         with self.lock:
-            task_name = self.tasks_in_progress.pop(worker_uuid, None)
             self.busy_workers.discard(worker_uuid)
-            if task_name is None:
-                return None
-            self.tasks_pending.insert(0, task_name)
-            return task_name
+        return task.name if task else None
 
     def available_local_workers(self, limit):
         with self.lock:
@@ -146,8 +241,31 @@ class MasterState:
             return available[:limit]
 
     def current_load(self):
+        return self.task_manager.get_load()
+
+    def cleanup_dead_worker(self, worker_uuid):
         with self.lock:
-            return len(self.tasks_pending)
+            self.worker_heartbeats.pop(worker_uuid, None)
+            self.local_workers.discard(worker_uuid)
+            self.busy_workers.discard(worker_uuid)
+            self.pending_redirects.pop(worker_uuid, None)
+            self.pending_releases.pop(worker_uuid, None)
+            borrowed = self.borrowed_workers.pop(worker_uuid, None)
+            self.lent_workers.pop(worker_uuid, None)
+
+        task = self.task_manager.requeue_task(worker_uuid)
+        if task:
+            log_event(
+                "WORKER DEAD",
+                f"Worker {worker_uuid} morreu; task {task.name} retornou para tasks_todo",
+            )
+        else:
+            log_event("WORKER DEAD", f"Worker {worker_uuid} morreu sem tarefa ativa")
+
+        if borrowed and borrowed.get("original_master_address"):
+            notify_worker_dead(borrowed["original_master_address"], worker_uuid)
+
+        return task
 
 
 master_state = MasterState(
@@ -239,13 +357,23 @@ def validate_worker_status(payload):
     return status, worker_uuid
 
 
+def validate_worker_heartbeat(payload):
+    worker_uuid = ensure_string_field(payload, "WORKER_UUID")
+    origin_server_uuid = payload.get("SERVER_UUID")
+    if origin_server_uuid is not None and (
+        not isinstance(origin_server_uuid, str) or not origin_server_uuid.strip()
+    ):
+        raise ValueError("Campo SERVER_UUID invalido")
+    return worker_uuid, origin_server_uuid
+
+
 def pop_next_task():
     return master_state.assign_next_task("UNKNOWN_WORKER")
 
 
 def push_task_front(task_name):
     with master_state.lock:
-        master_state.tasks_pending.insert(0, task_name)
+        master_state.task_manager.tasks_todo.appendleft(Task(name=task_name))
 
 
 def worker_origin_label(origin_server_uuid):
@@ -258,6 +386,11 @@ def maybe_negotiate_help():
     negotiate_help_if_saturated(master_state, request_help_from_peer)
 
 
+def calculate_workers_needed(state):
+    overload = max(0, state.current_load() - state.capacity)
+    return overload
+
+
 def negotiate_help_if_saturated(state, requester):
     with state.lock:
         if state.help_request_pending:
@@ -267,12 +400,16 @@ def negotiate_help_if_saturated(state, requester):
     if load <= state.capacity or not state.peers:
         return False
 
-    workers_needed = max(1, load - state.capacity)
+    workers_needed = calculate_workers_needed(state)
+    if workers_needed == 0:
+        return False
+
     for peer_id, peer_address in state.peers.items():
         response = requester(peer_id, peer_address, load, workers_needed)
         if response and response.get("type") == "response_accepted":
             with state.lock:
                 state.help_request_pending = True
+            log_event("SATURATION", f"Saturated load={load}; help requested from {peer_id} for {workers_needed} workers")
             return True
     return False
 
@@ -281,6 +418,31 @@ def saturation_monitor_loop():
     while True:
         negotiate_help_if_saturated(master_state, request_help_from_peer)
         time.sleep(HELP_CHECK_INTERVAL)
+
+
+def monitor_workers_loop():
+    while True:
+        now = time.time()
+        expired = []
+        with master_state.lock:
+            for worker_uuid, heartbeat in list(master_state.worker_heartbeats.items()):
+                if now - heartbeat["last_heartbeat"] > HEARTBEAT_TIMEOUT:
+                    heartbeat["missed_intervals"] += 1
+                    log_event(
+                        "HEARTBEAT",
+                        f"Worker {worker_uuid} missed heartbeat {heartbeat['missed_intervals']}/{MAX_MISSED_HEARTBEATS}",
+                    )
+                    if heartbeat["missed_intervals"] >= MAX_MISSED_HEARTBEATS:
+                        expired.append(worker_uuid)
+        for worker_uuid in expired:
+            master_state.cleanup_dead_worker(worker_uuid)
+        time.sleep(HEARTBEAT_CHECK_INTERVAL)
+
+
+def start_monitoring_workers():
+    thread = threading.Thread(target=monitor_workers_loop, daemon=True)
+    thread.start()
+    return thread
 
 
 def start_saturation_monitor():
@@ -312,7 +474,7 @@ def request_help_from_peer(peer_id, peer_address, current_load, workers_needed):
             log_protocol("M2M IN", message_type, response_request_id, f"peer={peer_id}")
             return response
     except (OSError, TimeoutError, socket.timeout, ValueError) as exc:
-        print(f"[M2M] Falha ao negociar com {peer_id}: {exc}")
+        log_event("M2M", f"Falha ao negociar com {peer_id}: {exc}")
         return None
 
 
@@ -352,6 +514,31 @@ def handle_request_help_message(state, request_id, payload):
     )
 
 
+def handle_heartbeat_message(state, request_id, payload):
+    worker_uuid, origin_server_uuid = validate_worker_heartbeat(payload)
+    state.update_worker_heartbeat(worker_uuid, origin_server_uuid)
+    log_event("HEARTBEAT", f"Recebido heartbeat de {worker_uuid}")
+    return build_master_message(
+        "heartbeat_ack",
+        request_id,
+        {"worker_id": worker_uuid},
+    )
+
+
+def handle_notify_worker_dead_message(state, request_id, payload):
+    worker_id = ensure_string_field(payload, "worker_id")
+    source_server = ensure_string_field(payload, "source_server")
+    with state.lock:
+        state.lent_workers.pop(worker_id, None)
+        state.pending_redirects.pop(worker_id, None)
+    log_event("NOTIFY", f"Worker morto notificado: {worker_id} de {source_server}")
+    return build_master_message(
+        "notify_worker_dead_ack",
+        request_id,
+        {"worker_id": worker_id},
+    )
+
+
 def handle_register_temporary_worker_message(state, request_id, payload):
     worker_id = ensure_string_field(payload, "worker_id")
     original_master_address = ensure_string_field(payload, "original_master_address")
@@ -364,7 +551,7 @@ def handle_register_temporary_worker_message(state, request_id, payload):
         state.local_workers.discard(worker_id)
         state.help_request_pending = False
 
-    print(f"[BORROWED] Worker {worker_id} registrado de {original_master_address}")
+    log_event("BORROWED", f"Worker {worker_id} registrado de {original_master_address}")
     return build_master_message(
         "register_temporary_worker_ack",
         request_id,
@@ -377,7 +564,7 @@ def handle_notify_worker_returned_message(state, request_id, payload):
     with state.lock:
         state.lent_workers.pop(worker_id, None)
         state.pending_redirects.pop(worker_id, None)
-    print(f"[RETURNED] Worker {worker_id} voltou ao {state.master_uuid}")
+    log_event("RETURNED", f"Worker {worker_id} voltou ao {state.master_uuid}")
     return build_master_message(
         "notify_worker_returned_ack",
         request_id,
@@ -414,7 +601,23 @@ def notify_worker_returned(original_master_address, worker_id):
             log_protocol("M2M OUT", "notify_worker_returned", request_id, f"worker={worker_id}")
             send_json(sock, message)
     except (OSError, TimeoutError, socket.timeout, ValueError) as exc:
-        print(f"[M2M] Falha ao notificar devolucao de {worker_id}: {exc}")
+        log_event("M2M", f"Falha ao notificar devolucao de {worker_id}: {exc}")
+
+
+def notify_worker_dead(original_master_address, worker_id):
+    request_id = str(uuid.uuid4())
+    message = build_master_message(
+        "notify_worker_dead",
+        request_id,
+        {"worker_id": worker_id, "source_server": MASTER_UUID},
+    )
+    try:
+        with socket.create_connection(parse_address(original_master_address), timeout=NEGOTIATION_TIMEOUT) as sock:
+            sock.settimeout(NEGOTIATION_TIMEOUT)
+            log_protocol("M2M OUT", "notify_worker_dead", request_id, f"worker={worker_id}")
+            send_json(sock, message)
+    except (OSError, TimeoutError, socket.timeout, ValueError) as exc:
+        log_event("M2M", f"Falha ao notificar worker morto {worker_id}: {exc}")
 
 
 def handle_master_message(conn, payload):
@@ -433,12 +636,22 @@ def handle_master_message(conn, payload):
         response = handle_notify_worker_returned_message(master_state, request_id, message_payload)
         send_json(conn, response)
         log_protocol("M2M OUT", response["type"], response["request_id"])
+    elif message_type == "heartbeat":
+        response = handle_heartbeat_message(master_state, request_id, message_payload)
+        send_json(conn, response)
+        log_protocol("M2M OUT", response["type"], response["request_id"])
+    elif message_type == "notify_worker_dead":
+        response = handle_notify_worker_dead_message(master_state, request_id, message_payload)
+        send_json(conn, response)
+        log_protocol("M2M OUT", response["type"], response["request_id"])
     else:
-        print(f"[M2M] Tipo desconhecido ignorado: {message_type}")
+        log_event("M2M", f"Tipo desconhecido ignorado: {message_type}")
 
 
 def handle_worker_presentation(conn, payload):
     worker_uuid, origin_server_uuid = validate_worker_handshake(payload)
+    master_state.update_worker_heartbeat(worker_uuid, origin_server_uuid)
+
     if origin_server_uuid:
         with master_state.lock:
             master_state.borrowed_workers.setdefault(
@@ -462,7 +675,7 @@ def handle_worker_presentation(conn, payload):
             },
         )
         send_json(conn, response)
-        print(f"[REDIRECT] Worker {worker_uuid} enviado para {redirect['new_master_address']}")
+        log_event("REDIRECT", f"Worker {worker_uuid} enviado para {redirect['new_master_address']}")
         return worker_uuid, None
 
     if release:
@@ -475,7 +688,7 @@ def handle_worker_presentation(conn, payload):
         notify_worker_returned(release["original_master_address"], worker_uuid)
         with master_state.lock:
             master_state.borrowed_workers.pop(worker_uuid, None)
-        print(f"[RELEASE] Worker {worker_uuid} devolvido para {release['original_master_address']}")
+        log_event("RELEASE", f"Worker {worker_uuid} devolvido para {release['original_master_address']}")
         return worker_uuid, None
 
     queue_releases_if_needed(master_state)
@@ -487,14 +700,14 @@ def handle_worker_presentation(conn, payload):
     else:
         response = {"TASK": "NO_TASK"}
 
-    print(
-        f"[WORKER] {worker_uuid} apresentou-se ao {MASTER_UUID} "
-        f"como {worker_origin_label(origin_server_uuid)}"
+    log_event(
+        "WORKER",
+        f"{worker_uuid} apresentou-se ao {MASTER_UUID} como {worker_origin_label(origin_server_uuid)}",
     )
     if next_task:
-        print(f"[DISPATCH] {next_task} -> Worker {worker_uuid}")
+        log_event("DISPATCH", f"{next_task} atribuido a Worker {worker_uuid}")
     else:
-        print(f"[FILA] Nenhuma tarefa disponivel para Worker {worker_uuid}")
+        log_event("QUEUE", f"Nenhuma tarefa disponivel para Worker {worker_uuid}")
     send_json(conn, response)
     return worker_uuid, next_task
 
@@ -512,9 +725,9 @@ def handle_worker_status(conn, payload, current_worker_uuid, current_task):
 
     ack = {"STATUS": "ACK", "WORKER_UUID": worker_uuid}
 
-    print(
-        f"[STATUS RECEBIDO] Worker {worker_uuid} concluiu {current_task} "
-        f"com status {status}"
+    log_event(
+        "TASK",
+        f"Worker {worker_uuid} concluiu {current_task} com status {status}",
     )
     master_state.complete_worker_task(worker_uuid, status)
     send_json(conn, ack)
@@ -527,13 +740,13 @@ def tratar_cliente(conn, addr):
     conn.settimeout(SOCKET_TIMEOUT)
 
     try:
-        print(f"[THREAD] Atendimento {addr}")
+        log_event("THREAD", f"Atendimento {addr}")
 
         while True:
             try:
                 data = conn.recv(1024)
             except socket.timeout:
-                print(f"[TIMEOUT] Encerrando conexao inativa de {addr}")
+                log_event("TIMEOUT", f"Encerrando conexao inativa de {addr}")
                 break
 
             if not data:
@@ -549,7 +762,7 @@ def tratar_cliente(conn, addr):
 
                 try:
                     dados = parse_json_message(mensagem)
-                    print("[REQ]:", dados)
+                    log_event("REQ", f"{dados}")
 
                     if "type" in dados:
                         handle_master_message(conn, dados)
@@ -563,10 +776,10 @@ def tratar_cliente(conn, addr):
                     else:
                         raise ValueError("Mensagem sem tipo conhecido")
                 except ValueError as exc:
-                    print(f"[PROTOCOLO] {addr}: {exc}")
+                    log_event("PROTOCOLO", f"{addr}: {exc}")
                     send_json(conn, {"ERROR": "INVALID_PAYLOAD", "DETAIL": str(exc)})
     except Exception as exc:
-        print("[ERRO]:", exc)
+        log_event("ERRO", f"{exc}")
     finally:
         requeued_task = None
         if current_worker_uuid is not None:
@@ -575,11 +788,11 @@ def tratar_cliente(conn, addr):
             push_task_front(current_task)
             requeued_task = current_task
         if requeued_task is not None:
-            print(
-                f"[REQUEUE] {requeued_task} retornou para a fila apos falha na conexao "
-                f"com Worker {current_worker_uuid or addr}"
+            log_event(
+                "REQUEUE",
+                f"{requeued_task} retornou para a fila apos falha na conexao com Worker {current_worker_uuid or addr}",
             )
-        print(f"[THREAD] Encerrando {addr}")
+        log_event("THREAD", f"Encerrando {addr}")
         conn.close()
 
 
@@ -589,8 +802,9 @@ def iniciar_servidor():
     server_socket.bind((HOST, PORT))
     server_socket.listen(100)
 
-    print(f"Servidor {MASTER_UUID} rodando em {HOST}:{PORT}")
+    log_event("START", f"Servidor {MASTER_UUID} rodando em {HOST}:{PORT}")
     start_saturation_monitor()
+    start_monitoring_workers()
 
     while True:
         conn, addr = server_socket.accept()
