@@ -1,6 +1,8 @@
 import json
 import os
+import shutil
 import socket
+import ssl
 import threading
 import time
 import uuid
@@ -21,6 +23,14 @@ HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "8"))
 HEARTBEAT_CHECK_INTERVAL = int(os.getenv("HEARTBEAT_CHECK_INTERVAL", "2"))
 MAX_MISSED_HEARTBEATS = int(os.getenv("MAX_MISSED_HEARTBEATS", "3"))
+SUPERVISOR_ENABLED = os.getenv("SUPERVISOR_ENABLED", "1")
+SUPERVISOR_HOST = os.getenv("SUPERVISOR_HOST", "nuted-ia.dev")
+SUPERVISOR_PORT = int(os.getenv("SUPERVISOR_PORT", "443"))
+SUPERVISOR_INTERVAL = int(os.getenv("SUPERVISOR_INTERVAL", "10"))
+SUPERVISOR_TLS = os.getenv("SUPERVISOR_TLS", "1")
+SUPERVISOR_SNI = os.getenv("SUPERVISOR_SNI", SUPERVISOR_HOST)
+SUPERVISOR_PAYLOAD_VERSION = "sprint4-monitor"
+PROCESS_START_TIME = time.time()
 
 
 def build_initial_tasks(task_count):
@@ -154,6 +164,8 @@ class MasterState:
     pending_releases: dict = field(default_factory=dict)
     help_request_pending: bool = False
     worker_heartbeats: dict = field(default_factory=dict)
+    worker_failures: int = 0
+    peer_status: dict = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
@@ -252,6 +264,7 @@ class MasterState:
             self.pending_releases.pop(worker_uuid, None)
             borrowed = self.borrowed_workers.pop(worker_uuid, None)
             self.lent_workers.pop(worker_uuid, None)
+            self.worker_failures += 1
 
         task = self.task_manager.requeue_task(worker_uuid)
         if task:
@@ -382,6 +395,249 @@ def worker_origin_label(origin_server_uuid):
     return "LOCAL"
 
 
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def utc_timestamp(now=None):
+    current = time.time() if now is None else now
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current))
+
+
+def supervisor_hostname(master_uuid):
+    return os.getenv("HOSTNAME") or f"{master_uuid}.farm.local"
+
+
+def collect_system_metrics(now=None):
+    current = time.time() if now is None else now
+    uptime_seconds = max(0, int(current - PROCESS_START_TIME))
+    load_average_1m = 0.0
+    load_average_5m = 0.0
+    if hasattr(os, "getloadavg"):
+        try:
+            load_average_1m, load_average_5m, _ = os.getloadavg()
+        except OSError:
+            load_average_1m = 0.0
+            load_average_5m = 0.0
+
+    count_logical = os.cpu_count() or 1
+    count_physical = count_logical
+    cpu_usage_percent = min(100.0, round((load_average_1m / count_logical) * 100, 2))
+
+    total_mb = 0
+    available_mb = 0
+    if hasattr(os, "sysconf"):
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            physical_pages = os.sysconf("SC_PHYS_PAGES")
+            available_pages = os.sysconf("SC_AVPHYS_PAGES")
+            total_mb = int((page_size * physical_pages) / (1024 * 1024))
+            available_mb = int((page_size * available_pages) / (1024 * 1024))
+        except (OSError, ValueError):
+            total_mb = 0
+            available_mb = 0
+    memory_used = max(0, total_mb - available_mb)
+    memory_percent_used = round((memory_used / total_mb) * 100, 2) if total_mb else 0.0
+
+    disk_usage = shutil.disk_usage("/")
+    disk_total_gb = round(disk_usage.total / (1024 ** 3), 2)
+    disk_free_gb = round(disk_usage.free / (1024 ** 3), 2)
+    disk_percent_used = (
+        round(((disk_usage.total - disk_usage.free) / disk_usage.total) * 100, 2)
+        if disk_usage.total
+        else 0.0
+    )
+
+    return {
+        "uptime_seconds": uptime_seconds,
+        "load_average_1m": round(load_average_1m, 2),
+        "load_average_5m": round(load_average_5m, 2),
+        "cpu": {
+            "usage_percent": cpu_usage_percent,
+            "count_logical": count_logical,
+            "count_physical": count_physical,
+        },
+        "memory": {
+            "total_mb": total_mb,
+            "available_mb": available_mb,
+            "percent_used": memory_percent_used,
+            "memory_used": memory_used,
+        },
+        "disk": {
+            "total_gb": disk_total_gb,
+            "free_gb": disk_free_gb,
+            "percent_used": disk_percent_used,
+        },
+    }
+
+
+def borrowed_worker_peer_uuid(worker_id, worker_data, worker_heartbeats):
+    heartbeat = worker_heartbeats.get(worker_id, {})
+    return (
+        heartbeat.get("origin_server_uuid")
+        or worker_data.get("peer_uuid")
+        or worker_data.get("original_master_id")
+        or worker_data.get("original_master_address")
+        or "unknown"
+    )
+
+
+def lent_worker_peer_uuid(worker_data):
+    return (
+        worker_data.get("borrower")
+        or worker_data.get("peer_uuid")
+        or worker_data.get("new_master_address")
+        or "unknown"
+    )
+
+
+def build_farm_state_metrics(state, now=None):
+    with state.lock:
+        local_workers = set(state.local_workers)
+        busy_workers = set(state.busy_workers)
+        borrowed_workers = dict(state.borrowed_workers)
+        lent_workers = dict(state.lent_workers)
+        worker_heartbeats = dict(state.worker_heartbeats)
+        worker_failures = state.worker_failures
+
+    with state.task_manager.lock:
+        tasks_pending = len(state.task_manager.tasks_todo)
+        tasks_running = len(state.task_manager.tasks_doing)
+        oldest_task_age_s = 0
+
+    registered_workers = local_workers | set(borrowed_workers) | set(lent_workers)
+    alive_workers = set(worker_heartbeats)
+    idle_workers = alive_workers - busy_workers - set(lent_workers)
+    workers_home = local_workers - set(lent_workers)
+
+    tasks_completed = sum(1 for task in state.tasks_done if task.get("status") == "OK")
+    tasks_failed = sum(1 for task in state.tasks_done if task.get("status") == "NOK")
+
+    borrowed_worker_entries = []
+    for worker_id, worker_data in sorted(lent_workers.items()):
+        borrowed_worker_entries.append(
+            {"direction": "out", "peer_uuid": lent_worker_peer_uuid(worker_data)}
+        )
+    for worker_id, worker_data in sorted(borrowed_workers.items()):
+        borrowed_worker_entries.append(
+            {
+                "direction": "in",
+                "peer_uuid": borrowed_worker_peer_uuid(worker_id, worker_data, worker_heartbeats),
+            }
+        )
+
+    return {
+        "workers": {
+            "total_registered": len(registered_workers),
+            "workers_utilization": len(busy_workers),
+            "workers_alive": len(alive_workers),
+            "workers_idle": len(idle_workers),
+            "workers_borrowed": len(lent_workers),
+            "workers_received": len(borrowed_workers),
+            "workers_failed": worker_failures,
+            "workers_home": len(workers_home),
+            "workers_available_capacity": len(idle_workers),
+            "borrowed_workers": borrowed_worker_entries,
+        },
+        "tasks": {
+            "tasks_pending": tasks_pending,
+            "tasks_running": tasks_running,
+            "tasks_completed": tasks_completed,
+            "tasks_failed": tasks_failed,
+            "oldest_task_age_s": oldest_task_age_s,
+        },
+    }
+
+
+def build_neighbor_metrics(state):
+    with state.lock:
+        peer_status = dict(state.peer_status)
+
+    neighbors = []
+    for peer_id in sorted(state.peers):
+        status = peer_status.get(peer_id, {})
+        neighbors.append(
+            {
+                "server_uuid": peer_id,
+                "status": status.get("status", "unavailable"),
+                "last_heartbeat": status.get("last_heartbeat"),
+            }
+        )
+    return neighbors
+
+
+def build_supervisor_payload(state, hostname=None, now=None, message_id=None):
+    return {
+        "server_uuid": state.master_uuid,
+        "hostname": hostname or supervisor_hostname(state.master_uuid),
+        "role": "master",
+        "task": "performance_report",
+        "timestamp": utc_timestamp(now),
+        "message_id": message_id or str(uuid.uuid4()),
+        "payload_version": SUPERVISOR_PAYLOAD_VERSION,
+        "performance": {
+            "system": collect_system_metrics(now),
+            "farm_state": build_farm_state_metrics(state, now),
+            "config_thresholds": {
+                "max_task": state.capacity,
+                "warn_cpu_percent": 85,
+                "warn_memory_percent": 85,
+                "release_task": state.release_threshold,
+            },
+            "neighbors": build_neighbor_metrics(state),
+        },
+    }
+
+
+def send_supervisor_payload(
+    payload,
+    host=SUPERVISOR_HOST,
+    port=SUPERVISOR_PORT,
+    use_tls=True,
+    sni=None,
+    connector=socket.create_connection,
+    timeout=NEGOTIATION_TIMEOUT,
+):
+    encoded_payload = (json.dumps(payload) + "\n").encode()
+    with connector((host, port), timeout=timeout) as raw_sock:
+        if use_tls:
+            context = ssl.create_default_context()
+            with context.wrap_socket(raw_sock, server_hostname=sni or host) as tls_sock:
+                tls_sock.sendall(encoded_payload)
+        else:
+            raw_sock.sendall(encoded_payload)
+
+
+def supervisor_metrics_loop():
+    while True:
+        try:
+            payload = build_supervisor_payload(master_state)
+            send_supervisor_payload(
+                payload,
+                host=SUPERVISOR_HOST,
+                port=SUPERVISOR_PORT,
+                use_tls=parse_bool(SUPERVISOR_TLS),
+                sni=SUPERVISOR_SNI,
+            )
+            log_event("SUPERVISOR", f"Metricas enviadas para {SUPERVISOR_HOST}:{SUPERVISOR_PORT}")
+        except (OSError, TimeoutError, ssl.SSLError, ValueError) as exc:
+            log_event("SUPERVISOR", f"Falha ao enviar metricas: {exc}")
+        time.sleep(SUPERVISOR_INTERVAL)
+
+
+def start_supervisor_metrics(enabled=None, thread_factory=threading.Thread):
+    should_start = parse_bool(SUPERVISOR_ENABLED if enabled is None else enabled)
+    if not should_start:
+        log_event("SUPERVISOR", "Envio de metricas desabilitado")
+        return None
+
+    thread = thread_factory(target=supervisor_metrics_loop, daemon=True)
+    thread.start()
+    return thread
+
+
 def maybe_negotiate_help():
     negotiate_help_if_saturated(master_state, request_help_from_peer)
 
@@ -472,8 +728,18 @@ def request_help_from_peer(peer_id, peer_address, current_load, workers_needed):
             if response_request_id != request_id:
                 raise ValueError("response request_id diferente da requisicao")
             log_protocol("M2M IN", message_type, response_request_id, f"peer={peer_id}")
+            with master_state.lock:
+                master_state.peer_status[peer_id] = {
+                    "status": "available",
+                    "last_heartbeat": utc_timestamp(),
+                }
             return response
     except (OSError, TimeoutError, socket.timeout, ValueError) as exc:
+        with master_state.lock:
+            master_state.peer_status[peer_id] = {
+                "status": "unavailable",
+                "last_heartbeat": None,
+            }
         log_event("M2M", f"Falha ao negociar com {peer_id}: {exc}")
         return None
 
@@ -806,6 +1072,7 @@ def iniciar_servidor():
     log_event("START", f"Servidor {MASTER_UUID} rodando em {HOST}:{PORT}")
     start_saturation_monitor()
     start_monitoring_workers()
+    start_supervisor_metrics()
 
     while True:
         conn, addr = server_socket.accept()

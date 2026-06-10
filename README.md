@@ -11,6 +11,7 @@ O fluxo atual cobre:
 - Sprint 1: heartbeat entre Worker e Master para verificar disponibilidade.
 - Sprint 2: apresentacao do Worker, distribuicao de tarefas, processamento simulado, envio de status final e confirmacao por `ACK`.
 - Sprint 3: negociacao P2P entre Masters, redirecionamento temporario de Workers emprestados e devolucao ao Master de origem.
+- Sprint 4: envio automatico de metricas do Master para o Supervisor de Metricas via TLS sobre TCP.
 
 ## Arquivos
 
@@ -39,6 +40,8 @@ O fluxo atual cobre:
 - Enfileira `command_release` e envia `notify_worker_returned` quando a carga cai abaixo de `RELEASE_THRESHOLD`.
 - Se um Worker desconectar enquanto processa uma tarefa, devolve a tarefa para o inicio da fila.
 - Faz validacao basica dos payloads e registra erros de protocolo.
+- Envia relatorios `performance_report` para o supervisor externo da Sprint 4.
+- Usa TLS sobre TCP para o supervisor, sem HTTP e sem aguardar resposta.
 
 ### Worker
 
@@ -203,6 +206,30 @@ Resposta recusada:
 }
 ```
 
+### 7. Relatorio de metricas para o Supervisor
+
+O Master envia automaticamente, a cada 10 segundos, um JSON terminado por `\n` para o supervisor da Sprint 4. A conexao padrao e TLS sobre TCP em `nuted-ia.dev:443`; o processo apenas conecta, envia e fecha, sem chamar `recv`.
+
+Campos principais:
+
+```json
+{
+  "server_uuid": "Master_A",
+  "hostname": "Master_A.farm.local",
+  "role": "master",
+  "task": "performance_report",
+  "timestamp": "2026-06-10T12:00:00Z",
+  "message_id": "uuid-v4",
+  "payload_version": "sprint4-monitor",
+  "performance": {
+    "system": {},
+    "farm_state": {},
+    "config_thresholds": {},
+    "neighbors": []
+  }
+}
+```
+
 ## Como executar
 
 Em um terminal, inicie o Master:
@@ -234,10 +261,23 @@ Tambem e possivel customizar:
 - `CAPACITY`: quantidade de tarefas pendentes que dispara `request_help`.
 - `RELEASE_THRESHOLD`: carga abaixo da qual Workers emprestados podem ser devolvidos.
 - `HELP_CHECK_INTERVAL`: intervalo, em segundos, entre verificacoes de saturacao.
+- `SUPERVISOR_ENABLED`: habilita envio de metricas da Sprint 4. Padrao `1`.
+- `SUPERVISOR_HOST`: host do supervisor. Padrao `nuted-ia.dev`.
+- `SUPERVISOR_PORT`: porta do supervisor. Padrao `443`.
+- `SUPERVISOR_INTERVAL`: intervalo entre envios de metricas. Padrao `10`.
+- `SUPERVISOR_TLS`: usa TLS quando `1`. Padrao `1`.
+- `SUPERVISOR_SNI`: SNI usado na conexao TLS. Padrao igual a `SUPERVISOR_HOST`.
+- `HOSTNAME`: hostname enviado no payload. Padrao `<MASTER_UUID>.farm.local`.
 - `WORKER_ID`
 - `SERVER_UUID`
 - `MASTER_TIMEOUT`
 - `RECONNECT_DELAY`
+
+Para desabilitar o envio durante testes locais:
+
+```bash
+SUPERVISOR_ENABLED=0 python3 server.py
+```
 
 ### Simulacao local da Sprint 3
 
