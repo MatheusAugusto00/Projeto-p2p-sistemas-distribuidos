@@ -59,3 +59,14 @@
 - [ ] Update `README.md` with the autonomous monitor behavior.
 - [ ] Run `python3 -m unittest discover -v`.
 - [ ] Run `PYTHONPYCACHEPREFIX=/private/tmp/pycache-sprint3 python3 -m py_compile server.py client.py tests/test_sprint3.py`.
+
+### Task 7: Borrowed Worker Interoperability
+
+- [ ] Extend `tests/test_sprint3.py` with failing tests proving `command_redirect` includes `original_master_id`, the Worker prefers that value for `SERVER_UUID`, and falls back to the original address when no id is provided.
+- [ ] Extend `tests/test_sprint3.py` with a failing test proving a missing, timed out, closed, or non-standard `register_temporary_worker` ACK does not prevent the Worker from continuing to the next Sprint 2 presentation.
+- [ ] Update `server.py` so `command_redirect` payloads keep `new_master_address` and `original_master_address`, and also include optional `original_master_id`.
+- [ ] Update `client.py` so redirect handling records `origin_server_uuid` from `original_master_id` first, then configured `SERVER_UUID`, then `original_master_address`.
+- [ ] Update `client.py` so temporary registration sends the official `register_temporary_worker` payload but treats ACK parsing as best-effort logging only.
+- [ ] Run `python3 -m unittest discover -v`.
+- [ ] Run `PYTHONPYCACHEPREFIX=/private/tmp/pycache-sprint3 python3 -m py_compile server.py client.py tests/test_sprint3.py`.
+- [ ] Run a local two-Master simulation and confirm the redirected Worker receives `TASK: QUERY` and sends `STATUS`.

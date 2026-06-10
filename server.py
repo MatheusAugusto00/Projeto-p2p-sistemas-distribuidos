@@ -7,17 +7,17 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 
-HOST = os.getenv("MASTER_HOST", "127.0.0.1")
+HOST = os.getenv("MASTER_HOST", "192.168.1.187")
 PORT = int(os.getenv("MASTER_PORT", "8000"))
 MASTER_UUID = os.getenv("MASTER_UUID", "Master_A")
 SOCKET_TIMEOUT = int(os.getenv("MASTER_SOCKET_TIMEOUT", "10"))
 NEGOTIATION_TIMEOUT = int(os.getenv("NEGOTIATION_TIMEOUT", "5"))
 CAPACITY = int(os.getenv("CAPACITY", "100"))
 RELEASE_THRESHOLD = int(os.getenv("RELEASE_THRESHOLD", str(int(CAPACITY * 0.6))))
-PEER_MASTERS = os.getenv("PEER_MASTERS", "")
+PEER_MASTERS = os.getenv("PEER_MASTERS", "GUTO@10.0.0.5:8000")
 HELP_CHECK_INTERVAL = int(os.getenv("HELP_CHECK_INTERVAL", "2"))
-INITIAL_TASK_COUNT = int(os.getenv("INITIAL_TASK_COUNT", "50"))
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "2"))
+INITIAL_TASK_COUNT = int(os.getenv("INITIAL_TASK_COUNT", "0"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "8"))
 HEARTBEAT_CHECK_INTERVAL = int(os.getenv("HEARTBEAT_CHECK_INTERVAL", "2"))
 MAX_MISSED_HEARTBEATS = int(os.getenv("MAX_MISSED_HEARTBEATS", "3"))
@@ -672,6 +672,7 @@ def handle_worker_presentation(conn, payload):
             {
                 "new_master_address": redirect["new_master_address"],
                 "original_master_address": format_address(HOST, PORT),
+                "original_master_id": master_state.master_uuid,
             },
         )
         send_json(conn, response)

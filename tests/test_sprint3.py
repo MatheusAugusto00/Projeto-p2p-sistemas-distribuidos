@@ -180,8 +180,68 @@ class Sprint3MasterTests(unittest.TestCase):
         self.assertEqual(calls, [("Master_B", ("127.0.0.1", 8001), 3, 2)])
         self.assertTrue(state.help_request_pending)
 
+    def test_command_redirect_payload_includes_original_master_id(self):
+        original_state = server.master_state
+        state = server.MasterState(
+            master_uuid="Master_B",
+            peers={},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+        state.pending_redirects["B1"] = {
+            "new_master_address": "127.0.0.1:8000",
+            "requester": "Master_A",
+        }
+
+        class FakeConn:
+            def __init__(self):
+                self.sent = []
+
+            def sendall(self, data):
+                self.sent.append(data)
+
+        conn = FakeConn()
+
+        try:
+            server.master_state = state
+            worker_uuid, task = server.handle_worker_presentation(
+                conn,
+                {"WORKER": "ALIVE", "WORKER_UUID": "B1"},
+            )
+        finally:
+            server.master_state = original_state
+
+        response = server.parse_json_message(conn.sent[0].decode().strip())
+        self.assertEqual(worker_uuid, "B1")
+        self.assertIsNone(task)
+        self.assertEqual(response["type"], "command_redirect")
+        self.assertEqual(response["payload"]["new_master_address"], "127.0.0.1:8000")
+        self.assertEqual(response["payload"]["original_master_id"], "Master_B")
+
 
 class Sprint3WorkerTests(unittest.TestCase):
+    def test_worker_redirect_prefers_original_master_id_for_server_uuid(self):
+        state = client.WorkerState(
+            worker_id="B1",
+            original_master_host="127.0.0.1",
+            original_master_port=8001,
+        )
+
+        client.apply_command_redirect(
+            state,
+            {
+                "new_master_address": "127.0.0.1:8000",
+                "original_master_address": "127.0.0.1:8001",
+                "original_master_id": "Master_B",
+            },
+        )
+
+        presentation = client.build_worker_presentation_payload(state)
+
+        self.assertEqual(state.origin_server_uuid, "Master_B")
+        self.assertEqual(presentation["SERVER_UUID"], "Master_B")
+
     def test_worker_redirect_switches_current_master_and_marks_origin(self):
         state = client.WorkerState(
             worker_id="B1",
@@ -201,6 +261,70 @@ class Sprint3WorkerTests(unittest.TestCase):
         self.assertEqual(state.origin_server_uuid, "127.0.0.1:8001")
         self.assertEqual(register_payload["type"], "register_temporary_worker")
         self.assertEqual(register_payload["payload"]["worker_id"], "B1")
+
+    def test_worker_presentation_after_redirect_uses_origin_fallback(self):
+        state = client.WorkerState(
+            worker_id="B1",
+            original_master_host="127.0.0.1",
+            original_master_port=8001,
+        )
+        client.apply_command_redirect(
+            state,
+            {
+                "new_master_address": "127.0.0.1:8000",
+                "original_master_address": "127.0.0.1:8001",
+            },
+        )
+
+        presentation = client.build_worker_presentation_payload(state)
+
+        self.assertEqual(
+            presentation,
+            {
+                "WORKER": "ALIVE",
+                "WORKER_UUID": "B1",
+                "SERVER_UUID": "127.0.0.1:8001",
+            },
+        )
+
+    def test_register_temporary_worker_ack_failure_is_non_fatal(self):
+        state = client.WorkerState(
+            worker_id="B1",
+            original_master_host="127.0.0.1",
+            original_master_port=8001,
+            current_master_host="127.0.0.1",
+            current_master_port=8000,
+            origin_server_uuid="Master_B",
+        )
+
+        class ClosingSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def sendall(self, data):
+                self.sent = data
+
+            def recv(self, size):
+                return b""
+
+        def fake_connector(address, timeout):
+            return ClosingSocket()
+
+        registered = client.register_temporary_worker_best_effort(
+            state,
+            connector=fake_connector,
+            logger=lambda level, message: None,
+        )
+
+        self.assertFalse(registered)
+        self.assertEqual((state.current_master_host, state.current_master_port), ("127.0.0.1", 8000))
+        self.assertEqual(state.origin_server_uuid, "Master_B")
 
     def test_worker_release_returns_to_original_master(self):
         state = client.WorkerState(

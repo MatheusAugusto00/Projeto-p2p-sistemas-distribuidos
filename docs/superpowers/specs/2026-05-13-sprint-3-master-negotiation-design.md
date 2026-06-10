@@ -43,6 +43,8 @@ Essa verificacao roda em uma thread propria de monitoramento. Assim, um Master s
 
 Ao aceitar, o Master ofertante envia `command_redirect` aos Workers selecionados. Como o projeto atual usa Workers que abrem conexoes curtas em loop, o comando sera entregue como resposta a uma apresentacao normal do Worker quando ele estiver ocioso. O Worker reconecta ao novo Master e envia `register_temporary_worker`, depois continua usando o fluxo da Sprint 2 com `SERVER_UUID` preenchido com seu Master original.
 
+Para interoperabilidade com Masters de outras equipes, o Worker nao deve bloquear aguardando um ACK especifico para `register_temporary_worker`. Ele deve enviar o registro, aceitar `register_temporary_worker_ack` quando existir, mas tambem seguir para o ciclo Sprint 2 se o Master externo fechar a conexao, nao responder dentro do timeout ou responder com um payload nao padronizado. O `command_redirect` enviado pelo nosso Master inclui o campo opcional `original_master_id`, alem de `original_master_address`, para que Workers nossos usem um identificador estavel no campo `SERVER_UUID`; se o campo nao vier de um Master externo, o Worker usa o identificador de origem configurado e, por ultimo, o endereco original como fallback.
+
 Quando a carga do Master receptor cair abaixo de `RELEASE_THRESHOLD`, ele envia `command_release` para Workers emprestados ociosos e envia `notify_worker_returned` ao Master de origem. O Worker volta ao Master original.
 
 ## Componentes
@@ -62,6 +64,8 @@ Quando a carga do Master receptor cair abaixo de `RELEASE_THRESHOLD`, ele envia 
   - Tratamento de `command_redirect`.
   - Tratamento de `command_release`.
   - Envio de `register_temporary_worker`.
+  - Registro temporario tolerante a ACK ausente, timeout, conexao encerrada ou resposta nao padronizada.
+  - Preferencia por `original_master_id` como `SERVER_UUID` apos redirecionamento.
   - Continuidade do protocolo da Sprint 2 apos a reconexao.
 
 ## Testes
@@ -77,6 +81,8 @@ Serao adicionados testes com `unittest`, sem dependencias externas, cobrindo:
 - Movimentacao de tarefas entre `pending`, `in_progress` e `done`.
 - Devolucao de tarefa para `pending` quando um Worker sair durante o processamento.
 - Pedido de ajuda disparado pelo monitor de saturacao sem depender de apresentacao de Worker.
+- Worker redirecionado usando `original_master_id` como `SERVER_UUID`.
+- Worker redirecionado seguindo para apresentacao Sprint 2 mesmo sem ACK padronizado do registro temporario.
 
 ## Fora de Escopo
 

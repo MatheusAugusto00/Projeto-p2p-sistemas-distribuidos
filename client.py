@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-HOST = os.getenv("MASTER_HOST", "127.0.0.1")
+HOST = os.getenv("MASTER_HOST", "192.168.1.187")
 PORT = int(os.getenv("MASTER_PORT", "8000"))
 
 WORKER_ID = os.getenv("WORKER_ID", f"W-{os.getpid()}")
@@ -118,9 +118,13 @@ def heartbeat_loop():
 
 
 def montar_payload_apresentacao():
-    payload = {"WORKER": "ALIVE", "WORKER_UUID": worker_state.worker_id}
-    if worker_state.origin_server_uuid:
-        payload["SERVER_UUID"] = worker_state.origin_server_uuid
+    return build_worker_presentation_payload(worker_state)
+
+
+def build_worker_presentation_payload(state):
+    payload = {"WORKER": "ALIVE", "WORKER_UUID": state.worker_id}
+    if state.origin_server_uuid:
+        payload["SERVER_UUID"] = state.origin_server_uuid
     return payload
 
 
@@ -143,10 +147,47 @@ def apply_command_redirect(state, payload):
     if not isinstance(original_master_address, str) or not original_master_address.strip():
         raise ValueError("command_redirect sem original_master_address valido")
 
+    original_master_id = payload.get("original_master_id")
+    if original_master_id is not None and (
+        not isinstance(original_master_id, str) or not original_master_id.strip()
+    ):
+        raise ValueError("command_redirect com original_master_id invalido")
+
     state.current_master_host, state.current_master_port = parse_address(new_master_address)
     state.original_master_host, state.original_master_port = parse_address(original_master_address)
-    state.origin_server_uuid = original_master_address
+    if original_master_id:
+        state.origin_server_uuid = original_master_id.strip()
+    elif not state.origin_server_uuid:
+        state.origin_server_uuid = original_master_address
     return build_register_temporary_worker_payload(state)
+
+
+def register_temporary_worker_best_effort(state, connector=socket.create_connection, logger=log_event):
+    register_payload = build_register_temporary_worker_payload(state)
+    try:
+        with connector(
+            (state.current_master_host, state.current_master_port),
+            timeout=MASTER_TIMEOUT,
+        ) as register_sock:
+            register_sock.settimeout(MASTER_TIMEOUT)
+            send_json(register_sock, register_payload)
+            register_ack = parse_server_message(receber_mensagem(register_sock))
+    except (ConnectionError, TimeoutError, socket.timeout, OSError, ValueError) as exc:
+        logger(
+            "REGISTER",
+            f"Registro temporario sem ACK padronizado; seguindo para apresentacao Sprint 2: {exc}",
+        )
+        return False
+
+    if register_ack.get("type") == "register_temporary_worker_ack":
+        logger("REGISTER", f"ACK de registro temporario recebido: {register_ack}")
+        return True
+
+    logger(
+        "REGISTER",
+        f"Resposta de registro temporario nao padronizada; seguindo para apresentacao Sprint 2: {register_ack}",
+    )
+    return False
 
 
 def apply_command_release(state, payload):
@@ -202,19 +243,12 @@ def worker_loop():
 
                 task = validar_resposta_inicial(resposta)
                 if task == "command_redirect":
-                    register_payload = apply_command_redirect(worker_state, resposta["payload"])
+                    apply_command_redirect(worker_state, resposta["payload"])
                     log_event(
                         "REDIRECT",
                         f"Worker {worker_state.worker_id} indo para {worker_state.current_master_host}:{worker_state.current_master_port}",
                     )
-                    with socket.create_connection(
-                        (worker_state.current_master_host, worker_state.current_master_port),
-                        timeout=MASTER_TIMEOUT,
-                    ) as register_sock:
-                        register_sock.settimeout(MASTER_TIMEOUT)
-                        send_json(register_sock, register_payload)
-                        register_ack = parse_server_message(receber_mensagem(register_sock))
-                        print("[REGISTER ACK]:", register_ack)
+                    register_temporary_worker_best_effort(worker_state)
                     continue
                 if task == "command_release":
                     apply_command_release(worker_state, resposta["payload"])
