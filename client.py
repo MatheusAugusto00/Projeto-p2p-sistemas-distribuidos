@@ -133,21 +133,36 @@ def build_register_temporary_worker_payload(state):
         "register_temporary_worker",
         {
             "worker_id": state.worker_id,
+            "WORKER_ID": state.worker_id,
             "original_master_address": state.original_master_address,
+            "ORIGINAL_MASTER_ADDRESS": state.original_master_address,
         },
     )
 
 
+def get_payload_alias(payload, canonical_name, alias_name=None, default=None):
+    if canonical_name in payload:
+        return payload.get(canonical_name)
+    if alias_name and alias_name in payload:
+        return payload.get(alias_name)
+    return default
+
+
 def apply_command_redirect(state, payload):
-    new_master_address = payload.get("new_master_address")
+    new_master_address = get_payload_alias(payload, "new_master_address", "NEW_MASTER_ADDRESS")
     if not isinstance(new_master_address, str) or not new_master_address.strip():
         raise ValueError("command_redirect sem new_master_address valido")
 
-    original_master_address = payload.get("original_master_address", state.original_master_address)
+    original_master_address = get_payload_alias(
+        payload,
+        "original_master_address",
+        "ORIGINAL_MASTER_ADDRESS",
+        state.original_master_address,
+    )
     if not isinstance(original_master_address, str) or not original_master_address.strip():
         raise ValueError("command_redirect sem original_master_address valido")
 
-    original_master_id = payload.get("original_master_id")
+    original_master_id = get_payload_alias(payload, "original_master_id", "ORIGINAL_MASTER_ID")
     if original_master_id is not None and (
         not isinstance(original_master_id, str) or not original_master_id.strip()
     ):
@@ -191,7 +206,12 @@ def register_temporary_worker_best_effort(state, connector=socket.create_connect
 
 
 def apply_command_release(state, payload):
-    original_master_address = payload.get("original_master_address", state.original_master_address)
+    original_master_address = get_payload_alias(
+        payload,
+        "original_master_address",
+        "ORIGINAL_MASTER_ADDRESS",
+        state.original_master_address,
+    )
     if not isinstance(original_master_address, str) or not original_master_address.strip():
         raise ValueError("command_release sem original_master_address valido")
 

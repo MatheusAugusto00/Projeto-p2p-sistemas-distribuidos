@@ -45,6 +45,8 @@ Ao aceitar, o Master ofertante envia `command_redirect` aos Workers selecionados
 
 Para interoperabilidade com Masters de outras equipes, o Worker nao deve bloquear aguardando um ACK especifico para `register_temporary_worker`. Ele deve enviar o registro, aceitar `register_temporary_worker_ack` quando existir, mas tambem seguir para o ciclo Sprint 2 se o Master externo fechar a conexao, nao responder dentro do timeout ou responder com um payload nao padronizado. O `command_redirect` enviado pelo nosso Master inclui o campo opcional `original_master_id`, alem de `original_master_address`, para que Workers nossos usem um identificador estavel no campo `SERVER_UUID`; se o campo nao vier de um Master externo, o Worker usa o identificador de origem configurado e, por ultimo, o endereco original como fallback.
 
+O padrao interno do projeto permanece com campos em minusculo (`master_id`, `workers_needed`, `new_master_address`, `worker_id`, `original_master_address`). Para interoperar com implementacoes de outras equipes que usam os nomes em maiusculo do material de aula, a borda do protocolo aceita aliases como `MASTER_ID`, `WORKERS_NEEDED`, `NEW_MASTER_ADDRESS`, `WORKER_ID` e `ORIGINAL_MASTER_ADDRESS`. A normalizacao deve acontecer somente nos handlers de entrada/saida, sem trocar os nomes internos usados nos testes e no restante do codigo.
+
 Quando a carga do Master receptor cair abaixo de `RELEASE_THRESHOLD`, ele envia `command_release` para Workers emprestados ociosos e envia `notify_worker_returned` ao Master de origem. O Worker volta ao Master original.
 
 ## Componentes
@@ -83,6 +85,7 @@ Serao adicionados testes com `unittest`, sem dependencias externas, cobrindo:
 - Pedido de ajuda disparado pelo monitor de saturacao sem depender de apresentacao de Worker.
 - Worker redirecionado usando `original_master_id` como `SERVER_UUID`.
 - Worker redirecionado seguindo para apresentacao Sprint 2 mesmo sem ACK padronizado do registro temporario.
+- Compatibilidade com payloads externos que usam aliases em maiusculo para negociacao M2M e comandos de Worker.
 
 ## Fora de Escopo
 

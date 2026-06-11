@@ -70,3 +70,12 @@
 - [ ] Run `python3 -m unittest discover -v`.
 - [ ] Run `PYTHONPYCACHEPREFIX=/private/tmp/pycache-sprint3 python3 -m py_compile server.py client.py tests/test_sprint3.py`.
 - [ ] Run a local two-Master simulation and confirm the redirected Worker receives `TASK: QUERY` and sends `STATUS`.
+
+### Task 8: Protocol Alias Adapter
+
+- [ ] Extend `tests/test_sprint3.py` with failing tests proving `request_help`, `register_temporary_worker`, `notify_worker_returned`, `notify_worker_dead`, `command_redirect`, and `command_release` accept uppercase aliases used by external teams.
+- [ ] Add edge helpers in `server.py` to read canonical lowercase fields first and uppercase aliases second.
+- [ ] Add edge helpers in `client.py` so Workers understand `NEW_MASTER_ADDRESS`, `ORIGINAL_MASTER_ADDRESS`, and `ORIGINAL_MASTER_ID` while keeping lowercase as the internal standard.
+- [ ] Include uppercase aliases in accepted `response_accepted` payloads and `command_redirect` payloads without removing the lowercase fields.
+- [ ] Run `python3 -m unittest discover -v`.
+- [ ] Run `PYTHONPYCACHEPREFIX=/private/tmp/pycache-sprint3 python3 -m py_compile server.py client.py tests/test_sprint3.py tests/test_sprint4.py`.

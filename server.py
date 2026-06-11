@@ -16,7 +16,7 @@ SOCKET_TIMEOUT = int(os.getenv("MASTER_SOCKET_TIMEOUT", "10"))
 NEGOTIATION_TIMEOUT = int(os.getenv("NEGOTIATION_TIMEOUT", "5"))
 CAPACITY = int(os.getenv("CAPACITY", "100"))
 RELEASE_THRESHOLD = int(os.getenv("RELEASE_THRESHOLD", str(int(CAPACITY * 0.6))))
-PEER_MASTERS = os.getenv("PEER_MASTERS", "GUTO@10.0.0.5:8000")
+PEER_MASTERS = os.getenv("PEER_MASTERS", "GUTO@10.0.0.4:8000")
 HELP_CHECK_INTERVAL = int(os.getenv("HELP_CHECK_INTERVAL", "2"))
 INITIAL_TASK_COUNT = int(os.getenv("INITIAL_TASK_COUNT", "0"))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
@@ -320,6 +320,36 @@ def ensure_string_field(payload, field_name, required=True):
         return None
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"Campo invalido: {field_name}")
+    return value
+
+
+def get_payload_alias(payload, canonical_name, alias_name=None, default=None):
+    if canonical_name in payload:
+        return payload.get(canonical_name)
+    if alias_name and alias_name in payload:
+        return payload.get(alias_name)
+    return default
+
+
+def ensure_string_alias(payload, canonical_name, alias_name=None, required=True):
+    value = get_payload_alias(payload, canonical_name, alias_name)
+    if value is None:
+        if required:
+            raise ValueError(f"Campo obrigatorio ausente: {canonical_name}")
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Campo invalido: {canonical_name}")
+    return value
+
+
+def ensure_int_alias(payload, canonical_name, alias_name=None, required=True, default=None):
+    value = get_payload_alias(payload, canonical_name, alias_name, default)
+    if value is None:
+        if required:
+            raise ValueError(f"Campo obrigatorio ausente: {canonical_name}")
+        return default
+    if not isinstance(value, int):
+        raise ValueError(f"Campo invalido: {canonical_name}")
     return value
 
 
@@ -711,10 +741,15 @@ def request_help_from_peer(peer_id, peer_address, current_load, workers_needed):
     request_id = str(uuid.uuid4())
     payload = {
         "master_id": MASTER_UUID,
+        "MASTER_ID": MASTER_UUID,
         "current_load": current_load,
+        "CURRENT_LOAD": current_load,
         "capacity": master_state.capacity,
+        "CAPACITY": master_state.capacity,
         "workers_needed": workers_needed,
+        "WORKERS_NEEDED": workers_needed,
         "return_address": format_address(HOST, PORT),
+        "RETURN_ADDRESS": format_address(HOST, PORT),
     }
     message = build_master_message("request_help", request_id, payload)
 
@@ -745,19 +780,22 @@ def request_help_from_peer(peer_id, peer_address, current_load, workers_needed):
 
 
 def handle_request_help_message(state, request_id, payload):
-    requester = ensure_string_field(payload, "master_id")
-    workers_needed = ensure_int_field(payload, "workers_needed")
-    return_address = payload.get("return_address")
+    requester = ensure_string_alias(payload, "master_id", "MASTER_ID")
+    workers_needed = ensure_int_alias(payload, "workers_needed", "WORKERS_NEEDED")
+    return_address = get_payload_alias(payload, "return_address", "RETURN_ADDRESS")
+    if not return_address and requester in state.peers:
+        return_address = format_address(*state.peers[requester])
 
     offered_workers = state.available_local_workers(workers_needed)
     if not offered_workers:
         return build_master_message(
             "response_rejected",
             request_id,
-            {"reason": "no_workers_available"},
+            {"reason": "no_workers_available", "REASON": "no_workers_available"},
         )
 
     worker_details = []
+    worker_details_upper = []
     with state.lock:
         for worker_uuid in offered_workers:
             state.pending_redirects[worker_uuid] = {
@@ -769,6 +807,7 @@ def handle_request_help_message(state, request_id, payload):
                 "new_master_address": return_address,
             }
             worker_details.append({"id": worker_uuid, "address": "dynamic"})
+            worker_details_upper.append({"ID": worker_uuid, "ADDRESS": "dynamic"})
 
     return build_master_message(
         "response_accepted",
@@ -776,6 +815,8 @@ def handle_request_help_message(state, request_id, payload):
         {
             "workers_offered": len(worker_details),
             "worker_details": worker_details,
+            "WORKERS_OFFERED": len(worker_details_upper),
+            "WORKER_DETAILS": worker_details_upper,
         },
     )
 
@@ -792,8 +833,8 @@ def handle_heartbeat_message(state, request_id, payload):
 
 
 def handle_notify_worker_dead_message(state, request_id, payload):
-    worker_id = ensure_string_field(payload, "worker_id")
-    source_server = ensure_string_field(payload, "source_server")
+    worker_id = ensure_string_alias(payload, "worker_id", "WORKER_ID")
+    source_server = ensure_string_alias(payload, "source_server", "SOURCE_SERVER")
     with state.lock:
         state.lent_workers.pop(worker_id, None)
         state.pending_redirects.pop(worker_id, None)
@@ -806,8 +847,12 @@ def handle_notify_worker_dead_message(state, request_id, payload):
 
 
 def handle_register_temporary_worker_message(state, request_id, payload):
-    worker_id = ensure_string_field(payload, "worker_id")
-    original_master_address = ensure_string_field(payload, "original_master_address")
+    worker_id = ensure_string_alias(payload, "worker_id", "WORKER_ID")
+    original_master_address = ensure_string_alias(
+        payload,
+        "original_master_address",
+        "ORIGINAL_MASTER_ADDRESS",
+    )
 
     with state.lock:
         state.borrowed_workers[worker_id] = {
@@ -821,12 +866,12 @@ def handle_register_temporary_worker_message(state, request_id, payload):
     return build_master_message(
         "register_temporary_worker_ack",
         request_id,
-        {"worker_id": worker_id},
+        {"worker_id": worker_id, "WORKER_ID": worker_id},
     )
 
 
 def handle_notify_worker_returned_message(state, request_id, payload):
-    worker_id = ensure_string_field(payload, "worker_id")
+    worker_id = ensure_string_alias(payload, "worker_id", "WORKER_ID")
     with state.lock:
         state.lent_workers.pop(worker_id, None)
         state.pending_redirects.pop(worker_id, None)
@@ -834,7 +879,7 @@ def handle_notify_worker_returned_message(state, request_id, payload):
     return build_master_message(
         "notify_worker_returned_ack",
         request_id,
-        {"worker_id": worker_id},
+        {"worker_id": worker_id, "WORKER_ID": worker_id},
     )
 
 
@@ -859,7 +904,7 @@ def notify_worker_returned(original_master_address, worker_id):
     message = build_master_message(
         "notify_worker_returned",
         request_id,
-        {"worker_id": worker_id},
+        {"worker_id": worker_id, "WORKER_ID": worker_id},
     )
     try:
         with socket.create_connection(parse_address(original_master_address), timeout=NEGOTIATION_TIMEOUT) as sock:
@@ -875,7 +920,12 @@ def notify_worker_dead(original_master_address, worker_id):
     message = build_master_message(
         "notify_worker_dead",
         request_id,
-        {"worker_id": worker_id, "source_server": MASTER_UUID},
+        {
+            "worker_id": worker_id,
+            "WORKER_ID": worker_id,
+            "source_server": MASTER_UUID,
+            "SOURCE_SERVER": MASTER_UUID,
+        },
     )
     try:
         with socket.create_connection(parse_address(original_master_address), timeout=NEGOTIATION_TIMEOUT) as sock:
@@ -937,8 +987,11 @@ def handle_worker_presentation(conn, payload):
             str(uuid.uuid4()),
             {
                 "new_master_address": redirect["new_master_address"],
+                "NEW_MASTER_ADDRESS": redirect["new_master_address"],
                 "original_master_address": format_address(HOST, PORT),
+                "ORIGINAL_MASTER_ADDRESS": format_address(HOST, PORT),
                 "original_master_id": master_state.master_uuid,
+                "ORIGINAL_MASTER_ID": master_state.master_uuid,
             },
         )
         send_json(conn, response)
@@ -949,7 +1002,10 @@ def handle_worker_presentation(conn, payload):
         response = build_master_message(
             "command_release",
             str(uuid.uuid4()),
-            {"original_master_address": release["original_master_address"]},
+            {
+                "original_master_address": release["original_master_address"],
+                "ORIGINAL_MASTER_ADDRESS": release["original_master_address"],
+            },
         )
         send_json(conn, response)
         notify_worker_returned(release["original_master_address"], worker_uuid)

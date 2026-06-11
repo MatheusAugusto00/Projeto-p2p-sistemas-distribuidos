@@ -63,6 +63,57 @@ class Sprint3MasterTests(unittest.TestCase):
         self.assertEqual([w["id"] for w in response["payload"]["worker_details"]], ["B1", "B2"])
         self.assertEqual(state.pending_redirects["B1"]["new_master_address"], "127.0.0.1:8000")
 
+    def test_request_help_accepts_uppercase_external_payload_aliases(self):
+        state = server.MasterState(
+            master_uuid="Master_B",
+            peers={},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+        state.register_local_worker("B1")
+
+        response = server.handle_request_help_message(
+            state,
+            "req-upper",
+            {
+                "MASTER_ID": "Master_A",
+                "CURRENT_LOAD": 15,
+                "CAPACITY": 10,
+                "WORKERS_NEEDED": 1,
+                "RETURN_ADDRESS": "127.0.0.1:8000",
+            },
+        )
+
+        self.assertEqual(response["type"], "response_accepted")
+        self.assertEqual(response["payload"]["workers_offered"], 1)
+        self.assertEqual(response["payload"]["WORKERS_OFFERED"], 1)
+        self.assertEqual(response["payload"]["WORKER_DETAILS"], [{"ID": "B1", "ADDRESS": "dynamic"}])
+        self.assertEqual(state.pending_redirects["B1"]["new_master_address"], "127.0.0.1:8000")
+
+    def test_request_help_without_return_address_uses_configured_peer_address(self):
+        state = server.MasterState(
+            master_uuid="Master_B",
+            peers={"Master_A": ("127.0.0.1", 8000)},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+        state.register_local_worker("B1")
+
+        server.handle_request_help_message(
+            state,
+            "req-peer-fallback",
+            {
+                "MASTER_ID": "Master_A",
+                "CURRENT_LOAD": 15,
+                "CAPACITY": 10,
+                "WORKERS_NEEDED": 1,
+            },
+        )
+
+        self.assertEqual(state.pending_redirects["B1"]["new_master_address"], "127.0.0.1:8000")
+
     def test_request_help_is_rejected_when_no_workers_available(self):
         state = server.MasterState(
             master_uuid="Master_B",
@@ -105,6 +156,70 @@ class Sprint3MasterTests(unittest.TestCase):
         self.assertEqual(response["type"], "register_temporary_worker_ack")
         self.assertEqual(response["request_id"], "req-register")
         self.assertEqual(state.borrowed_workers["B1"]["original_master_address"], "127.0.0.1:8001")
+
+    def test_register_temporary_worker_accepts_uppercase_external_payload_aliases(self):
+        state = server.MasterState(
+            master_uuid="Master_A",
+            peers={},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+
+        response = server.handle_register_temporary_worker_message(
+            state,
+            "req-register-upper",
+            {"WORKER_ID": "B1", "ORIGINAL_MASTER_ADDRESS": "127.0.0.1:8001"},
+        )
+
+        self.assertEqual(response["type"], "register_temporary_worker_ack")
+        self.assertEqual(response["payload"]["worker_id"], "B1")
+        self.assertEqual(response["payload"]["WORKER_ID"], "B1")
+        self.assertEqual(state.borrowed_workers["B1"]["original_master_address"], "127.0.0.1:8001")
+
+    def test_notify_worker_returned_accepts_uppercase_external_payload_aliases(self):
+        state = server.MasterState(
+            master_uuid="Master_B",
+            peers={},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+        state.lent_workers["B1"] = {"borrower": "Master_A"}
+        state.pending_redirects["B1"] = {"new_master_address": "127.0.0.1:8000"}
+
+        response = server.handle_notify_worker_returned_message(
+            state,
+            "req-returned-upper",
+            {"WORKER_ID": "B1"},
+        )
+
+        self.assertEqual(response["type"], "notify_worker_returned_ack")
+        self.assertEqual(response["payload"]["WORKER_ID"], "B1")
+        self.assertNotIn("B1", state.lent_workers)
+        self.assertNotIn("B1", state.pending_redirects)
+
+    def test_notify_worker_dead_accepts_uppercase_external_payload_aliases(self):
+        state = server.MasterState(
+            master_uuid="Master_B",
+            peers={},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+        state.lent_workers["B1"] = {"borrower": "Master_A"}
+        state.pending_redirects["B1"] = {"new_master_address": "127.0.0.1:8000"}
+
+        response = server.handle_notify_worker_dead_message(
+            state,
+            "req-dead-upper",
+            {"WORKER_ID": "B1", "SOURCE_SERVER": "Master_A"},
+        )
+
+        self.assertEqual(response["type"], "notify_worker_dead_ack")
+        self.assertEqual(response["payload"]["worker_id"], "B1")
+        self.assertNotIn("B1", state.lent_workers)
+        self.assertNotIn("B1", state.pending_redirects)
 
     def test_command_release_is_queued_for_borrowed_worker_below_threshold(self):
         state = server.MasterState(
@@ -218,9 +333,31 @@ class Sprint3MasterTests(unittest.TestCase):
         self.assertEqual(response["type"], "command_redirect")
         self.assertEqual(response["payload"]["new_master_address"], "127.0.0.1:8000")
         self.assertEqual(response["payload"]["original_master_id"], "Master_B")
+        self.assertEqual(response["payload"]["NEW_MASTER_ADDRESS"], "127.0.0.1:8000")
+        self.assertEqual(response["payload"]["ORIGINAL_MASTER_ID"], "Master_B")
 
 
 class Sprint3WorkerTests(unittest.TestCase):
+    def test_worker_redirect_accepts_uppercase_external_payload_aliases(self):
+        state = client.WorkerState(
+            worker_id="B1",
+            original_master_host="127.0.0.1",
+            original_master_port=8001,
+        )
+
+        register_payload = client.apply_command_redirect(
+            state,
+            {
+                "NEW_MASTER_ADDRESS": "127.0.0.1:8000",
+                "ORIGINAL_MASTER_ADDRESS": "127.0.0.1:8001",
+                "ORIGINAL_MASTER_ID": "Master_B",
+            },
+        )
+
+        self.assertEqual((state.current_master_host, state.current_master_port), ("127.0.0.1", 8000))
+        self.assertEqual(state.origin_server_uuid, "Master_B")
+        self.assertEqual(register_payload["payload"]["original_master_address"], "127.0.0.1:8001")
+
     def test_worker_redirect_prefers_original_master_id_for_server_uuid(self):
         state = client.WorkerState(
             worker_id="B1",
@@ -341,6 +478,21 @@ class Sprint3WorkerTests(unittest.TestCase):
         )
 
         client.apply_command_release(state, {"original_master_address": "127.0.0.1:8001"})
+
+        self.assertEqual((state.current_master_host, state.current_master_port), ("127.0.0.1", 8001))
+        self.assertIsNone(state.origin_server_uuid)
+
+    def test_worker_release_accepts_uppercase_external_payload_aliases(self):
+        state = client.WorkerState(
+            worker_id="B1",
+            original_master_host="127.0.0.1",
+            original_master_port=8001,
+            current_master_host="127.0.0.1",
+            current_master_port=8000,
+            origin_server_uuid="Master_B",
+        )
+
+        client.apply_command_release(state, {"ORIGINAL_MASTER_ADDRESS": "127.0.0.1:8001"})
 
         self.assertEqual((state.current_master_host, state.current_master_port), ("127.0.0.1", 8001))
         self.assertIsNone(state.origin_server_uuid)
