@@ -9,16 +9,16 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 
-HOST = os.getenv("MASTER_HOST", "192.168.1.187")
-PORT = int(os.getenv("MASTER_PORT", "8000"))
-MASTER_UUID = os.getenv("MASTER_UUID", "Master_A")
+HOST = os.getenv("MASTER_HOST", "192.168.1.141")
+PORT = int(os.getenv("MASTER_PORT", "8001"))
+MASTER_UUID = os.getenv("MASTER_UUID", "MASTER_4")
 SOCKET_TIMEOUT = int(os.getenv("MASTER_SOCKET_TIMEOUT", "10"))
 NEGOTIATION_TIMEOUT = int(os.getenv("NEGOTIATION_TIMEOUT", "5"))
 CAPACITY = int(os.getenv("CAPACITY", "100"))
 RELEASE_THRESHOLD = int(os.getenv("RELEASE_THRESHOLD", str(int(CAPACITY * 0.6))))
-PEER_MASTERS = os.getenv("PEER_MASTERS", "GUTO@10.0.0.4:8000")
+PEER_MASTERS = os.getenv("PEER_MASTERS", "Master_4@192.168.1.141:8000")
 HELP_CHECK_INTERVAL = int(os.getenv("HELP_CHECK_INTERVAL", "2"))
-INITIAL_TASK_COUNT = int(os.getenv("INITIAL_TASK_COUNT", "0"))
+INITIAL_TASK_COUNT = int(os.getenv("INITIAL_TASK_COUNT", "1000"))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "8"))
 HEARTBEAT_CHECK_INTERVAL = int(os.getenv("HEARTBEAT_CHECK_INTERVAL", "2"))
@@ -185,6 +185,21 @@ class MasterState:
             if worker_uuid not in self.borrowed_workers:
                 self.local_workers.add(worker_uuid)
 
+    def _mark_borrowed_worker_locked(self, worker_uuid, original_master_address):
+        worker_data = self.borrowed_workers.setdefault(
+            worker_uuid,
+            {"original_master_address": original_master_address, "registered_at": timestamp()},
+        )
+        current_address = worker_data.get("original_master_address")
+        if not current_address or (":" in original_master_address and ":" not in current_address):
+            worker_data["original_master_address"] = original_master_address
+        self.local_workers.discard(worker_uuid)
+        return worker_data
+
+    def register_borrowed_worker(self, worker_uuid, original_master_address):
+        with self.lock:
+            return self._mark_borrowed_worker_locked(worker_uuid, original_master_address)
+
     def register_worker_heartbeat(self, worker_uuid, origin_server_uuid=None):
         with self.lock:
             self.worker_heartbeats[worker_uuid] = {
@@ -192,11 +207,8 @@ class MasterState:
                 "missed_intervals": 0,
                 "origin_server_uuid": origin_server_uuid,
             }
-            if origin_server_uuid:
-                self.borrowed_workers.setdefault(
-                    worker_uuid,
-                    {"original_master_address": origin_server_uuid, "registered_at": timestamp()},
-                )
+            if origin_server_uuid and origin_server_uuid != self.master_uuid:
+                self._mark_borrowed_worker_locked(worker_uuid, origin_server_uuid)
             else:
                 self.local_workers.add(worker_uuid)
 
@@ -214,6 +226,8 @@ class MasterState:
             heartbeat["missed_intervals"] = 0
             if origin_server_uuid:
                 heartbeat["origin_server_uuid"] = origin_server_uuid
+                if origin_server_uuid != self.master_uuid:
+                    self._mark_borrowed_worker_locked(worker_uuid, origin_server_uuid)
             return heartbeat
 
     def assign_next_task(self, worker_uuid):
@@ -240,6 +254,17 @@ class MasterState:
         with self.lock:
             self.busy_workers.discard(worker_uuid)
         return task.name if task else None
+
+    def mark_borrowed_worker_returned(self, worker_uuid):
+        with self.lock:
+            borrowed = self.borrowed_workers.pop(worker_uuid, None)
+            self.worker_heartbeats.pop(worker_uuid, None)
+            self.busy_workers.discard(worker_uuid)
+            self.local_workers.discard(worker_uuid)
+            self.pending_releases.pop(worker_uuid, None)
+            self.pending_redirects.pop(worker_uuid, None)
+        log_event("LIFECYCLE", f"Worker {worker_uuid} removido do estado de emprestado devolvido")
+        return borrowed
 
     def available_local_workers(self, limit):
         with self.lock:
@@ -523,6 +548,12 @@ def lent_worker_peer_uuid(worker_data):
     )
 
 
+def metric_hostname(master_uuid):
+    if not master_uuid or ":" in master_uuid or master_uuid == "unknown":
+        return master_uuid
+    return f"{master_uuid}.farm.local"
+
+
 def build_farm_state_metrics(state, now=None):
     with state.lock:
         local_workers = set(state.local_workers)
@@ -539,36 +570,65 @@ def build_farm_state_metrics(state, now=None):
 
     registered_workers = local_workers | set(borrowed_workers) | set(lent_workers)
     alive_workers = set(worker_heartbeats)
-    idle_workers = alive_workers - busy_workers - set(lent_workers)
     workers_home = local_workers - set(lent_workers)
+    local_busy_workers = busy_workers & workers_home
+    idle_workers = (alive_workers & workers_home) - busy_workers
+    available_capacity_workers = alive_workers - busy_workers - set(lent_workers)
 
     tasks_completed = sum(1 for task in state.tasks_done if task.get("status") == "OK")
     tasks_failed = sum(1 for task in state.tasks_done if task.get("status") == "NOK")
 
     borrowed_worker_entries = []
     for worker_id, worker_data in sorted(lent_workers.items()):
-        borrowed_worker_entries.append(
-            {"direction": "out", "peer_uuid": lent_worker_peer_uuid(worker_data)}
-        )
-    for worker_id, worker_data in sorted(borrowed_workers.items()):
+        peer_uuid = lent_worker_peer_uuid(worker_data)
         borrowed_worker_entries.append(
             {
-                "direction": "in",
-                "peer_uuid": borrowed_worker_peer_uuid(worker_id, worker_data, worker_heartbeats),
+                "worker_uuid": worker_id,
+                "direction": "up",
+                "status": "BORROWED_OUT",
+                "peer_uuid": peer_uuid,
+                "parent_uuid": state.master_uuid,
+                "parent_hostname": metric_hostname(state.master_uuid),
+                "current_master_uuid": peer_uuid,
+            }
+        )
+    for worker_id, worker_data in sorted(borrowed_workers.items()):
+        peer_uuid = borrowed_worker_peer_uuid(worker_id, worker_data, worker_heartbeats)
+        peer_hostname = metric_hostname(peer_uuid)
+        current_hostname = metric_hostname(state.master_uuid)
+        borrowed_worker_entries.append(
+            {
+                "worker_uuid": worker_id,
+                "direction": "down",
+                "status": "BORROWED_IN",
+                "peer_uuid": peer_uuid,
+                "parent_uuid": peer_uuid,
+                "parent_hostname": peer_hostname,
+                "parent_node": peer_hostname,
+                "node_parent": peer_hostname,
+                "source_server": peer_uuid,
+                "source_hostname": peer_hostname,
+                "original_master_id": peer_uuid,
+                "original_master_uuid": peer_uuid,
+                "original_master_hostname": peer_hostname,
+                "home_master_uuid": peer_uuid,
+                "home_master_hostname": peer_hostname,
+                "current_master_uuid": state.master_uuid,
+                "current_master_hostname": current_hostname,
             }
         )
 
     return {
         "workers": {
             "total_registered": len(registered_workers),
-            "workers_utilization": len(busy_workers),
+            "workers_utilization": len(local_busy_workers),
             "workers_alive": len(alive_workers),
             "workers_idle": len(idle_workers),
             "workers_borrowed": len(lent_workers),
             "workers_received": len(borrowed_workers),
             "workers_failed": worker_failures,
             "workers_home": len(workers_home),
-            "workers_available_capacity": len(idle_workers),
+            "workers_available_capacity": len(available_capacity_workers),
             "borrowed_workers": borrowed_worker_entries,
         },
         "tasks": {
@@ -706,20 +766,33 @@ def saturation_monitor_loop():
         time.sleep(HELP_CHECK_INTERVAL)
 
 
+def collect_expired_workers(
+    state,
+    now=None,
+    heartbeat_timeout=HEARTBEAT_TIMEOUT,
+    max_missed=MAX_MISSED_HEARTBEATS,
+):
+    current_time = time.time() if now is None else now
+    expired = []
+    with state.lock:
+        lent_workers = set(state.lent_workers)
+        for worker_uuid, heartbeat in list(state.worker_heartbeats.items()):
+            if worker_uuid in lent_workers:
+                continue
+            if current_time - heartbeat["last_heartbeat"] > heartbeat_timeout:
+                heartbeat["missed_intervals"] += 1
+                log_event(
+                    "HEARTBEAT",
+                    f"Worker {worker_uuid} missed heartbeat {heartbeat['missed_intervals']}/{max_missed}",
+                )
+                if heartbeat["missed_intervals"] >= max_missed:
+                    expired.append(worker_uuid)
+    return expired
+
+
 def monitor_workers_loop():
     while True:
-        now = time.time()
-        expired = []
-        with master_state.lock:
-            for worker_uuid, heartbeat in list(master_state.worker_heartbeats.items()):
-                if now - heartbeat["last_heartbeat"] > HEARTBEAT_TIMEOUT:
-                    heartbeat["missed_intervals"] += 1
-                    log_event(
-                        "HEARTBEAT",
-                        f"Worker {worker_uuid} missed heartbeat {heartbeat['missed_intervals']}/{MAX_MISSED_HEARTBEATS}",
-                    )
-                    if heartbeat["missed_intervals"] >= MAX_MISSED_HEARTBEATS:
-                        expired.append(worker_uuid)
+        expired = collect_expired_workers(master_state)
         for worker_uuid in expired:
             master_state.cleanup_dead_worker(worker_uuid)
         time.sleep(HEARTBEAT_CHECK_INTERVAL)
@@ -855,12 +928,8 @@ def handle_register_temporary_worker_message(state, request_id, payload):
     )
 
     with state.lock:
-        state.borrowed_workers[worker_id] = {
-            "original_master_address": original_master_address,
-            "registered_at": timestamp(),
-        }
-        state.local_workers.discard(worker_id)
         state.help_request_pending = False
+    state.register_borrowed_worker(worker_id, original_master_address)
 
     log_event("BORROWED", f"Worker {worker_id} registrado de {original_master_address}")
     return build_master_message(
@@ -968,14 +1037,12 @@ def handle_worker_presentation(conn, payload):
     worker_uuid, origin_server_uuid = validate_worker_handshake(payload)
     master_state.update_worker_heartbeat(worker_uuid, origin_server_uuid)
 
-    if origin_server_uuid:
-        with master_state.lock:
-            master_state.borrowed_workers.setdefault(
-                worker_uuid,
-                {"original_master_address": origin_server_uuid, "registered_at": timestamp()},
-            )
+    if origin_server_uuid and origin_server_uuid != master_state.master_uuid:
+        master_state.register_borrowed_worker(worker_uuid, origin_server_uuid)
     else:
         master_state.register_local_worker(worker_uuid)
+
+    queue_releases_if_needed(master_state)
 
     with master_state.lock:
         redirect = master_state.pending_redirects.pop(worker_uuid, None)
@@ -1009,12 +1076,10 @@ def handle_worker_presentation(conn, payload):
         )
         send_json(conn, response)
         notify_worker_returned(release["original_master_address"], worker_uuid)
-        with master_state.lock:
-            master_state.borrowed_workers.pop(worker_uuid, None)
+        master_state.mark_borrowed_worker_returned(worker_uuid)
         log_event("RELEASE", f"Worker {worker_uuid} devolvido para {release['original_master_address']}")
         return worker_uuid, None
 
-    queue_releases_if_needed(master_state)
     maybe_negotiate_help()
     next_task = master_state.assign_next_task(worker_uuid)
 

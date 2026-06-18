@@ -7,8 +7,8 @@ import time
 import uuid
 from dataclasses import dataclass
 
-HOST = os.getenv("MASTER_HOST", "192.168.1.187")
-PORT = int(os.getenv("MASTER_PORT", "8000"))
+HOST = os.getenv("MASTER_HOST", "127.0.0.1")
+PORT = int(os.getenv("MASTER_PORT", "8001"))
 
 WORKER_ID = os.getenv("WORKER_ID", f"W-{os.getpid()}")
 SERVER_UUID = os.getenv("SERVER_UUID")

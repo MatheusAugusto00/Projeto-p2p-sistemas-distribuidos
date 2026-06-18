@@ -49,6 +49,24 @@ O padrao interno do projeto permanece com campos em minusculo (`master_id`, `wor
 
 Quando a carga do Master receptor cair abaixo de `RELEASE_THRESHOLD`, ele envia `command_release` para Workers emprestados ociosos e envia `notify_worker_returned` ao Master de origem. O Worker volta ao Master original.
 
+## Correcao 2026-06-17: classificacao e devolucao de Worker emprestado
+
+Workers que se apresentarem ou enviarem heartbeat com `SERVER_UUID` diferente do Master atual devem ser mantidos como emprestados recebidos, nunca como Workers locais. O Master receptor deve remover esse Worker de `local_workers`, registrar sua origem em `borrowed_workers` e refletir isso no payload de metricas da Sprint 4.
+
+No payload de metricas, Workers emprestados para outro Master devem aparecer como direcao visual `up`, e Workers recebidos por emprestimo devem aparecer como direcao visual `down`, permitindo que a interface mostre a seta correta.
+
+Para Workers recebidos por emprestimo, o campo visual de pai/origem deve apontar para o Master original do Worker, nao para o Master receptor que esta enviando a metrica. Assim, no supervisor, um Worker `BORROWED_IN` recebido por `Master_A` de `Master_B` deve ter `parent_uuid` igual a `Master_B`; o `current_master_uuid` deve indicar `Master_A`. Para Workers emprestados para fora, `parent_uuid` continua sendo o Master de origem que esta reportando o emprestimo.
+
+Como o supervisor pode usar nomes diferentes para o campo de pai/origem, cada entrada `BORROWED_IN` deve repetir o Master de origem em aliases equivalentes: `parent_uuid`, `parent_hostname`, `parent_node`, `node_parent`, `source_server`, `source_hostname`, `original_master_id`, `original_master_uuid`, `original_master_hostname`, `home_master_uuid` e `home_master_hostname`.
+
+Os contadores agregados que o supervisor usa para desenhar Workers locais (`workers_idle` e `workers_utilization`) devem considerar apenas Workers da casa (`workers_home`). Workers recebidos por emprestimo devem aparecer em `workers_received`, `workers_available_capacity` quando ociosos, e na lista detalhada `borrowed_workers`, mas nao devem criar um no local `IDLE` ou `WORKING` sob o Master receptor.
+
+Quando `current_load <= RELEASE_THRESHOLD`, a decisao de devolucao deve acontecer antes de atribuir uma nova task ao Worker emprestado que acabou de se apresentar. Se esse Worker estiver ocioso e uma liberacao for enfileirada para ele, o Master deve responder `command_release` nessa mesma apresentacao e notificar o Master de origem com `notify_worker_returned`.
+
+Ao enviar `command_release`, o Master receptor deve encerrar completamente o estado local do emprestimo: remover o Worker de `borrowed_workers`, `busy_workers`, `pending_releases` e `worker_heartbeats`. Um Worker devolvido nao deve permanecer no monitor de heartbeat do Master receptor, pois depois da devolucao ele volta a enviar heartbeat ao Master de origem. Portanto, a devolucao nao deve incrementar `worker_failures` nem gerar estado visual `FAILED`.
+
+O Master de origem nao deve aplicar timeout de heartbeat sobre Workers que estao em `lent_workers`, pois durante o emprestimo esses Workers enviam heartbeat ao Master receptor. O Worker so deve sair de `lent_workers` quando houver `notify_worker_returned`, `notify_worker_dead` vindo do receptor, ou quando ele se apresentar novamente ao Master de origem apos receber `command_release`.
+
 ## Componentes
 
 - `server.py`

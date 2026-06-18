@@ -67,7 +67,7 @@ class Sprint4PayloadTests(unittest.TestCase):
         tasks = payload["performance"]["farm_state"]["tasks"]
 
         self.assertEqual(workers["total_registered"], 4)
-        self.assertEqual(workers["workers_utilization"], 1)
+        self.assertEqual(workers["workers_utilization"], 0)
         self.assertEqual(workers["workers_alive"], 3)
         self.assertEqual(workers["workers_idle"], 2)
         self.assertEqual(workers["workers_borrowed"], 1)
@@ -75,14 +75,91 @@ class Sprint4PayloadTests(unittest.TestCase):
         self.assertEqual(workers["workers_failed"], 1)
         self.assertEqual(workers["workers_home"], 2)
         self.assertEqual(workers["workers_available_capacity"], 2)
-        self.assertIn({"direction": "out", "peer_uuid": "michel_2"}, workers["borrowed_workers"])
-        self.assertIn({"direction": "in", "peer_uuid": "michel_3"}, workers["borrowed_workers"])
+        self.assertIn(
+            {
+                "worker_uuid": "L1",
+                "direction": "up",
+                "status": "BORROWED_OUT",
+                "peer_uuid": "michel_2",
+                "parent_uuid": "michel_1",
+                "parent_hostname": "michel_1.farm.local",
+                "current_master_uuid": "michel_2",
+            },
+            workers["borrowed_workers"],
+        )
+        self.assertIn(
+            {
+                "worker_uuid": "B1",
+                "direction": "down",
+                "status": "BORROWED_IN",
+                "peer_uuid": "michel_3",
+                "parent_uuid": "michel_3",
+                "parent_hostname": "michel_3.farm.local",
+                "parent_node": "michel_3.farm.local",
+                "node_parent": "michel_3.farm.local",
+                "source_server": "michel_3",
+                "source_hostname": "michel_3.farm.local",
+                "original_master_id": "michel_3",
+                "original_master_uuid": "michel_3",
+                "original_master_hostname": "michel_3.farm.local",
+                "home_master_uuid": "michel_3",
+                "home_master_hostname": "michel_3.farm.local",
+                "current_master_uuid": "michel_1",
+                "current_master_hostname": "michel_1.farm.local",
+            },
+            workers["borrowed_workers"],
+        )
 
         self.assertEqual(tasks["tasks_pending"], 0)
         self.assertEqual(tasks["tasks_running"], 1)
         self.assertEqual(tasks["tasks_completed"], 1)
         self.assertEqual(tasks["tasks_failed"], 1)
         self.assertEqual(tasks["oldest_task_age_s"], 0)
+
+    def test_supervisor_payload_treats_origin_heartbeat_worker_as_borrowed_down(self):
+        state = server.MasterState(
+            master_uuid="michel_1",
+            peers={},
+            capacity=100,
+            release_threshold=60,
+            task_queue=[],
+        )
+        state.register_local_worker("B1")
+        server.handle_heartbeat_message(
+            state,
+            "req-heartbeat",
+            {"WORKER_UUID": "B1", "SERVER_UUID": "michel_2"},
+        )
+
+        payload = server.build_supervisor_payload(state, hostname="host")
+        workers = payload["performance"]["farm_state"]["workers"]
+
+        self.assertEqual(workers["workers_home"], 0)
+        self.assertEqual(workers["workers_received"], 1)
+        self.assertEqual(workers["workers_idle"], 0)
+        self.assertEqual(workers["workers_available_capacity"], 1)
+        self.assertIn(
+            {
+                "worker_uuid": "B1",
+                "direction": "down",
+                "status": "BORROWED_IN",
+                "peer_uuid": "michel_2",
+                "parent_uuid": "michel_2",
+                "parent_hostname": "michel_2.farm.local",
+                "parent_node": "michel_2.farm.local",
+                "node_parent": "michel_2.farm.local",
+                "source_server": "michel_2",
+                "source_hostname": "michel_2.farm.local",
+                "original_master_id": "michel_2",
+                "original_master_uuid": "michel_2",
+                "original_master_hostname": "michel_2.farm.local",
+                "home_master_uuid": "michel_2",
+                "home_master_hostname": "michel_2.farm.local",
+                "current_master_uuid": "michel_1",
+                "current_master_hostname": "michel_1.farm.local",
+            },
+            workers["borrowed_workers"],
+        )
 
     def test_supervisor_payload_reports_thresholds_and_neighbors(self):
         state = self.build_state()

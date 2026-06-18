@@ -79,3 +79,34 @@
 - [ ] Include uppercase aliases in accepted `response_accepted` payloads and `command_redirect` payloads without removing the lowercase fields.
 - [ ] Run `python3 -m unittest discover -v`.
 - [ ] Run `PYTHONPYCACHEPREFIX=/private/tmp/pycache-sprint3 python3 -m py_compile server.py client.py tests/test_sprint3.py tests/test_sprint4.py`.
+
+### Task 9: Borrowed Worker Classification and Release Fix
+
+- [ ] Add failing tests proving heartbeat with `SERVER_UUID` records the Worker as borrowed, removes it from local Workers, and makes the Sprint 4 payload report received borrowed Workers with direction `down`.
+- [ ] Add a failing test proving `register_temporary_worker` replaces a prior heartbeat-only origin id with the real `original_master_address` used for return notification.
+- [ ] Add a failing test proving an idle borrowed Worker receives `command_release` in the same presentation where the Master notices load is below `RELEASE_THRESHOLD`.
+- [ ] Update `server.py` so any heartbeat or presentation with origin server information calls a single borrowed-worker registration path that discards the Worker from `local_workers`.
+- [ ] Update `server.py` so release queuing runs before dispatch and re-checks the current Worker's pending release before assigning a task.
+- [ ] Update Sprint 4 farm-state payload direction labels to `up` for lent Workers and `down` for received Workers.
+- [ ] Add explicit `worker_uuid`, `status`, `parent_uuid`, `parent_hostname`, and `current_master_uuid` fields to borrowed-worker metric entries so the supervisor does not infer the parent from the reporting Master.
+- [ ] Run `python3 -m unittest discover -v`.
+- [ ] Run `PYTHONPYCACHEPREFIX=/private/tmp/pycache-sprint3 python3 -m py_compile server.py client.py tests/test_sprint3.py tests/test_sprint4.py`.
+
+### Task 10: Lent Worker Heartbeat Ownership Fix
+
+- [ ] Add a failing test proving the Master of origin does not expire a Worker in `lent_workers` when that Worker's local heartbeat timestamp becomes stale.
+- [ ] Add a heartbeat-expiration helper in `server.py` that ignores Workers currently listed in `lent_workers`.
+- [ ] Update `monitor_workers_loop()` to use the helper before calling `cleanup_dead_worker()`.
+- [ ] Run `python3 -m unittest tests.test_sprint3 -v`.
+- [ ] Run `python3 -m unittest discover -v`.
+- [ ] Run `PYTHONPYCACHEPREFIX=/private/tmp/pycache-sprint3 python3 -m py_compile server.py client.py tests/test_sprint3.py tests/test_sprint4.py`.
+
+### Task 11: Returned Borrowed Worker Cleanup Fix
+
+- [ ] Add a failing test proving that after `command_release`, the Master receptor removes the returned Worker from `borrowed_workers` and `worker_heartbeats`.
+- [ ] Add a failing test proving a returned borrowed Worker cannot later be collected as expired by the receptor heartbeat monitor.
+- [ ] Update `server.py` release handling to clean the returned Worker lifecycle state before it can be considered dead.
+- [ ] Add lifecycle logs that distinguish `LOCAL`, `BORROWED`, `RELEASE`, and `WORKER DEAD`.
+- [ ] Run `python3 -m unittest tests.test_sprint3 -v`.
+- [ ] Run `python3 -m unittest discover -v`.
+- [ ] Run `PYTHONPYCACHEPREFIX=/private/tmp/pycache-sprint3 python3 -m py_compile server.py client.py tests/test_sprint3.py tests/test_sprint4.py`.

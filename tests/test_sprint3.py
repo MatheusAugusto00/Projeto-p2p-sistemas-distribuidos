@@ -157,6 +157,28 @@ class Sprint3MasterTests(unittest.TestCase):
         self.assertEqual(response["request_id"], "req-register")
         self.assertEqual(state.borrowed_workers["B1"]["original_master_address"], "127.0.0.1:8001")
 
+    def test_register_temporary_worker_updates_origin_address_after_heartbeat(self):
+        state = server.MasterState(
+            master_uuid="Master_A",
+            peers={"Master_B": ("127.0.0.1", 8001)},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+        server.handle_heartbeat_message(
+            state,
+            "req-heartbeat",
+            {"WORKER_UUID": "B1", "SERVER_UUID": "Master_B"},
+        )
+
+        server.handle_register_temporary_worker_message(
+            state,
+            "req-register",
+            {"worker_id": "B1", "original_master_address": "127.0.0.1:8001"},
+        )
+
+        self.assertEqual(state.borrowed_workers["B1"]["original_master_address"], "127.0.0.1:8001")
+
     def test_register_temporary_worker_accepts_uppercase_external_payload_aliases(self):
         state = server.MasterState(
             master_uuid="Master_A",
@@ -236,6 +258,111 @@ class Sprint3MasterTests(unittest.TestCase):
         self.assertEqual(queued, ["B1"])
         self.assertEqual(state.pending_releases["B1"]["original_master_address"], "127.0.0.1:8001")
 
+    def test_heartbeat_with_origin_records_borrowed_worker_not_local(self):
+        state = server.MasterState(
+            master_uuid="Master_A",
+            peers={},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+        state.register_local_worker("B1")
+
+        response = server.handle_heartbeat_message(
+            state,
+            "req-heartbeat",
+            {"WORKER_UUID": "B1", "SERVER_UUID": "Master_B"},
+        )
+
+        self.assertEqual(response["type"], "heartbeat_ack")
+        self.assertNotIn("B1", state.local_workers)
+        self.assertIn("B1", state.borrowed_workers)
+        self.assertEqual(state.borrowed_workers["B1"]["original_master_address"], "Master_B")
+
+    def test_borrowed_worker_gets_release_before_new_task_when_load_is_below_threshold(self):
+        original_state = server.master_state
+        original_notify = server.notify_worker_returned
+        state = server.MasterState(
+            master_uuid="Master_A",
+            peers={},
+            capacity=10,
+            release_threshold=2,
+            task_queue=["Task1"],
+        )
+        state.borrowed_workers["B1"] = {"original_master_address": "127.0.0.1:8001"}
+        notified = []
+
+        class FakeConn:
+            def __init__(self):
+                self.sent = []
+
+            def sendall(self, data):
+                self.sent.append(data)
+
+        conn = FakeConn()
+
+        try:
+            server.master_state = state
+            server.notify_worker_returned = lambda address, worker_id: notified.append((address, worker_id))
+            worker_uuid, task = server.handle_worker_presentation(
+                conn,
+                {"WORKER": "ALIVE", "WORKER_UUID": "B1", "SERVER_UUID": "Master_B"},
+            )
+        finally:
+            server.master_state = original_state
+            server.notify_worker_returned = original_notify
+
+        response = server.parse_json_message(conn.sent[0].decode().strip())
+        self.assertEqual(worker_uuid, "B1")
+        self.assertIsNone(task)
+        self.assertEqual(response["type"], "command_release")
+        self.assertEqual(response["payload"]["original_master_address"], "127.0.0.1:8001")
+        self.assertEqual(notified, [("127.0.0.1:8001", "B1")])
+        self.assertNotIn("B1", state.borrowed_workers)
+        self.assertNotIn("B1", state.worker_heartbeats)
+        self.assertEqual(state.tasks_pending, ["Task1"])
+
+    def test_released_borrowed_worker_is_not_later_marked_dead_by_receiver(self):
+        original_state = server.master_state
+        original_notify = server.notify_worker_returned
+        state = server.MasterState(
+            master_uuid="Master_A",
+            peers={},
+            capacity=10,
+            release_threshold=2,
+            task_queue=[],
+        )
+        state.borrowed_workers["B1"] = {"original_master_address": "127.0.0.1:8001"}
+        state.update_worker_heartbeat("B1", "Master_B")
+
+        class FakeConn:
+            def __init__(self):
+                self.sent = []
+
+            def sendall(self, data):
+                self.sent.append(data)
+
+        try:
+            server.master_state = state
+            server.notify_worker_returned = lambda address, worker_id: None
+            server.handle_worker_presentation(
+                FakeConn(),
+                {"WORKER": "ALIVE", "WORKER_UUID": "B1", "SERVER_UUID": "Master_B"},
+            )
+        finally:
+            server.master_state = original_state
+            server.notify_worker_returned = original_notify
+
+        expired = server.collect_expired_workers(
+            state,
+            now=9999999999.0,
+            heartbeat_timeout=1,
+            max_missed=1,
+        )
+
+        self.assertEqual(expired, [])
+        self.assertEqual(state.worker_failures, 0)
+
     def test_task_moves_from_pending_to_in_progress_to_done(self):
         state = server.MasterState(
             master_uuid="Master_A",
@@ -274,6 +401,29 @@ class Sprint3MasterTests(unittest.TestCase):
         self.assertEqual(state.tasks_pending, ["Task1", "Task2"])
         self.assertEqual(state.tasks_in_progress, {})
         self.assertNotIn("W-1", state.busy_workers)
+
+    def test_lent_worker_is_not_expired_by_origin_master_heartbeat_monitor(self):
+        state = server.MasterState(
+            master_uuid="Master_B",
+            peers={},
+            capacity=10,
+            release_threshold=4,
+            task_queue=[],
+        )
+        state.register_local_worker("B1")
+        state.update_worker_heartbeat("B1")
+        with state.lock:
+            state.lent_workers["B1"] = {
+                "borrower": "Master_A",
+                "new_master_address": "192.168.1.141:8000",
+            }
+            state.worker_heartbeats["B1"]["last_heartbeat"] = 100.0
+
+        expired = server.collect_expired_workers(state, now=200.0, heartbeat_timeout=8, max_missed=3)
+
+        self.assertEqual(expired, [])
+        self.assertEqual(state.worker_heartbeats["B1"]["missed_intervals"], 0)
+        self.assertIn("B1", state.lent_workers)
 
     def test_saturated_master_negotiates_help_without_worker_presentation(self):
         state = server.MasterState(
